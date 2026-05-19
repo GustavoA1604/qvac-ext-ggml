@@ -4765,7 +4765,17 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
         threshold_ne0 = 128;
         threshold_ne1 = 128;
     }
+    // The Adreno mul_mv / transpose kernels assume K (ne0) is a multiple of 32
+    // and M (ne1) is a multiple of 4 -- asserted in
+    // ggml_backend_opencl_buffer_set_tensor's `if (use_adreno_kernels(...))`
+    // transpose branch and again in the use_adreno_kernels-guarded mul_mat
+    // dispatch sites. Tensors that violate either alignment must fall back to
+    // the generic OpenCL matmul path instead of aborting in the weights-upload
+    // stage. Surfaced by parakeet on Snapdragon 8 Gen 4 (Adreno 830): some
+    // joint / output projections in the CTC + TDT heads have non-multiple-of-4
+    // output channels and used to SIGABRT inside ggml_backend_opencl_buffer_set_tensor.
     return tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
+            tensor->ne[0] % 32 == 0 && tensor->ne[1] % 4 == 0 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 

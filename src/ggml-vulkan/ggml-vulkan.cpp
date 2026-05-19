@@ -6756,12 +6756,30 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
                    pipeline->wg_denoms[2]);
     }
     if (ctx->descriptor_set_idx >= ctx->descriptor_sets.size()) {
-        GGML_ABORT("ggml_vulkan: pipeline '%s' dispatch ran out of "
-                   "descriptor sets: idx=%u, available=%zu (likely missing "
-                   "an earlier ggml_pipeline_request_descriptor_sets call)",
-                   pipeline->name.c_str(),
-                   (unsigned)ctx->descriptor_set_idx,
-                   ctx->descriptor_sets.size());
+        // Lazy-grow fallback: the global descriptor pool is shared across
+        // every pipeline, but is sized from the sum of all upstream
+        // `ggml_pipeline_request_descriptor_sets` calls. If one dispatch
+        // path forgets to request -- or requests too few -- we'd otherwise
+        // abort right here, blowing away an entire graph run. Instead,
+        // request one more on the spot (the allocator grows the pool by
+        // 50% per miss, so amortised cost is negligible) and emit a
+        // one-shot warning so the missing-request site can still be
+        // tracked down out-of-band. The aborting behaviour is preserved
+        // implicitly: `ggml_pipeline_allocate_descriptor_sets` calls
+        // GGML_ABORT on a real OOM from `vkAllocateDescriptorSets`.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_vulkan: pipeline '%s' dispatch outran descriptor "
+                          "pool (idx=%u, available=%zu); growing pool lazily. "
+                          "Some upstream code path is dispatching without a "
+                          "matching ggml_pipeline_request_descriptor_sets call. "
+                          "Re-run with GGML_VULKAN_DEBUG=1 to identify it.\n",
+                          pipeline->name.c_str(),
+                          (unsigned)ctx->descriptor_set_idx,
+                          ctx->descriptor_sets.size());
+        }
+        ctx->pipeline_descriptor_set_requirements++;
+        ggml_pipeline_allocate_descriptor_sets(ctx);
     }
     if (descriptor_buffer_infos.size() > MAX_PARAMETER_COUNT) {
         GGML_ABORT("ggml_vulkan: pipeline '%s' dispatch has too many "
