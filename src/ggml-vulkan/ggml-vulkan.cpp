@@ -6732,13 +6732,60 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
     }
     std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
-    GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
-                wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
-                wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-    GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
-    GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
-    GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
-    GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
+    // Per-driver dispatch safety checks. Each one is a `GGML_ABORT` rather
+    // than `GGML_ASSERT(expr)` so the failing values land in the process
+    // tombstone (Android `ggml_abort`'s synchronous `fprintf(stderr)` path)
+    // -- otherwise the bare assertion just prints "GGML_ASSERT(<expr>)
+    // failed" with no actuals and the host has to recompile + repro to
+    // identify which limit was hit. Same rationale as the OpenCL
+    // `CL_CHECK` macro in src/ggml-opencl/ggml-opencl.cpp.
+    if (wg0 > ctx->device->properties.limits.maxComputeWorkGroupCount[0] ||
+        wg1 > ctx->device->properties.limits.maxComputeWorkGroupCount[1] ||
+        wg2 > ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
+        GGML_ABORT("ggml_vulkan: pipeline '%s' dispatch exceeds device "
+                   "maxComputeWorkGroupCount: requested (%u, %u, %u) vs "
+                   "device limit (%u, %u, %u) (elements (%u, %u, %u) / "
+                   "wg_denoms (%u, %u, %u))",
+                   pipeline->name.c_str(),
+                   wg0, wg1, wg2,
+                   ctx->device->properties.limits.maxComputeWorkGroupCount[0],
+                   ctx->device->properties.limits.maxComputeWorkGroupCount[1],
+                   ctx->device->properties.limits.maxComputeWorkGroupCount[2],
+                   elements[0], elements[1], elements[2],
+                   pipeline->wg_denoms[0], pipeline->wg_denoms[1],
+                   pipeline->wg_denoms[2]);
+    }
+    if (ctx->descriptor_set_idx >= ctx->descriptor_sets.size()) {
+        GGML_ABORT("ggml_vulkan: pipeline '%s' dispatch ran out of "
+                   "descriptor sets: idx=%u, available=%zu (likely missing "
+                   "an earlier ggml_pipeline_request_descriptor_sets call)",
+                   pipeline->name.c_str(),
+                   (unsigned)ctx->descriptor_set_idx,
+                   ctx->descriptor_sets.size());
+    }
+    if (descriptor_buffer_infos.size() > MAX_PARAMETER_COUNT) {
+        GGML_ABORT("ggml_vulkan: pipeline '%s' dispatch has too many "
+                   "descriptor buffers: got %zu, max %u (MAX_PARAMETER_COUNT)",
+                   pipeline->name.c_str(),
+                   descriptor_buffer_infos.size(),
+                   (unsigned)MAX_PARAMETER_COUNT);
+    }
+    if (pipeline->parameter_count != descriptor_buffer_infos.size()) {
+        GGML_ABORT("ggml_vulkan: pipeline '%s' parameter_count mismatch: "
+                   "pipeline expects %u buffers, dispatch passed %zu (shader "
+                   "/ dispatch site out of sync)",
+                   pipeline->name.c_str(),
+                   pipeline->parameter_count,
+                   descriptor_buffer_infos.size());
+    }
+    if (pipeline->push_constant_size != push_constant_size(push_constants)) {
+        GGML_ABORT("ggml_vulkan: pipeline '%s' push_constant_size mismatch: "
+                   "pipeline expects %u bytes, dispatch passed %zu bytes "
+                   "(shader push-constant layout out of sync with C++ struct)",
+                   pipeline->name.c_str(),
+                   pipeline->push_constant_size,
+                   push_constant_size(push_constants));
+    }
 
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
