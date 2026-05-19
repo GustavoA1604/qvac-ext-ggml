@@ -488,6 +488,13 @@ endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Android")
     target_link_libraries(ggml-base PRIVATE dl)
+    # liblog.so ships with bionic and provides `__android_log_print`,
+    # which `ggml_abort` calls (under `#if defined(__ANDROID__)`) so the
+    # formatted abort message reaches logcat / tombstones even when the
+    # host pipes child-process stderr to /dev/null (common with bare-
+    # runtime addons under react-native-bare-kit). Without this link the
+    # ggml-base.so emits an unresolved-symbol error at dlopen time.
+    target_link_libraries(ggml-base PRIVATE log)
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "visionOS")

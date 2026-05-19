@@ -37,6 +37,17 @@
 #include <syscall.h>
 #endif
 
+#if defined(__ANDROID__)
+// liblog ships with bionic; provides __android_log_print that surfaces into
+// logcat directly even when the process's stderr is /dev/null'd or piped to
+// a sink that doesn't flush before abort(). Used by `ggml_abort` to make
+// the formatted abort message reach Android tombstones / `adb logcat -b
+// crash` reliably -- without it the message is written via fprintf(stderr)
+// and silently dropped when the host (e.g. Bare-runtime addons under
+// react-native-bare-kit) doesn't pipe child-process stderr to logcat.
+#include <android/log.h>
+#endif
+
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <mach/mach.h>
@@ -252,6 +263,22 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
         fprintf(stderr, "%s\n", message);
         ggml_print_backtrace();
     }
+
+#if defined(__ANDROID__)
+    // Belt-and-suspenders: always push the formatted abort message into
+    // logcat directly, regardless of whether `g_abort_callback` consumed it
+    // or whether fprintf(stderr) reached an attached terminal. Many Android
+    // hosts (notably react-native-bare-kit's worklet, which routes
+    // GGML_LOG_* through an asynchronous RPC channel that doesn't flush
+    // before abort()) drop stderr entirely; without this call the abort
+    // line in the tombstone is just "Fatal signal 6 (SIGABRT)" with no
+    // hint about what triggered the assertion, leaving every consumer
+    // crash one offline rebuild + custom-callback away from being
+    // actionable. ANDROID_LOG_FATAL routes into the standard `adb logcat
+    // -b crash` ring buffer alongside libc's own crash header so the two
+    // lines show up adjacent to each other in any tombstone capture.
+    __android_log_print(ANDROID_LOG_FATAL, "ggml", "%s", message);
+#endif
 
     abort();
 }
