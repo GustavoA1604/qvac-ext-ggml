@@ -126,6 +126,19 @@ if(NOT TARGET ggml::ggml)
         PROPERTIES
             IMPORTED_LOCATION "${GGML_BASE_LIBRARY}")
 
+    # When ggml-base is consumed as a static library through this config file
+    # (vcpkg / install tree), its build-time PRIVATE link deps are *not*
+    # carried over: UNKNOWN IMPORTED targets have no INTERFACE_LINK_LIBRARIES.
+    # Re-surface the Android-only `liblog` dependency that `ggml_abort` pulls
+    # in via `__android_log_print`; otherwise downstream shared modules ship
+    # without `-llog` in their NEEDED list and dlopen fails with an
+    # unresolved-symbol error. Other auto-linked Android system libs
+    # (libdl, libc, libm) are added by the NDK driver implicitly.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+        set_property(TARGET ggml::ggml-base APPEND PROPERTY
+            INTERFACE_LINK_LIBRARIES log)
+    endif()
+
     if(GGML_MAX_NAME)
         set_property(TARGET ggml::ggml-base APPEND PROPERTY
             INTERFACE_COMPILE_DEFINITIONS "GGML_MAX_NAME=${GGML_MAX_NAME}")
