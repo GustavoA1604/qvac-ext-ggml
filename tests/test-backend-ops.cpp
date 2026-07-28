@@ -8467,13 +8467,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 65, 1, 128, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
-    // ...and must stay routable for non-f32 weights, where honouring it means the f32
-    // accumulator rather than f32 operands. These combinations have no f32-source pipeline,
-    // so a backend that exempts them from its reduced-precision path resolves to nothing.
+    // ...and must stay routable for an f16 weight, where honouring it means the f32
+    // accumulator rather than f32 operands. That combination has no f32-source pipeline,
+    // so a backend that exempts it from its reduced-precision path resolves to nothing.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 33, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    // A quantized weight does have one, via the dequantizing matmul. Models with
+    // activations outside fp16 range need fp32 arithmetic here too, and backends may reach
+    // it with a different pipeline family than the default one (small/medium/large tile
+    // and aligned variants), so sweep shapes that select across those families.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1056, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 33, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 65, 1, 256, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));

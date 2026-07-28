@@ -178,6 +178,10 @@ static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline);
 struct vk_matmul_pipeline_struct {
     vk_pipeline l, m, s;
     vk_pipeline a_l, a_m, a_s;
+    // Set when the family holds scalar (non-cooperative-matrix) shaders on a device
+    // that has cooperative matrices. Pipeline selection must then use the scalar tile
+    // heuristics, and only the tile sizes that fit shared memory exist.
+    bool scalar = false;
     // Returns true when all unaligned pipelines are null.
     // We only check for unaligned variants since one of the unaligned pipelines must exist
     // while aligned pipelines are optional
@@ -705,6 +709,12 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
+    // Scalar fp32-arithmetic variant for GGML_PREC_F32, only created when the
+    // default quantized path above multiplies in fp16 (i.e. a coopmat device).
+    // Cooperative matrices are fp16, so the coopmat paths convert F32 activations
+    // to fp16 and clamp anything past 65504; models with activations outside fp16
+    // range (Qwen3-style "massive activations" reach ~1e6) then compute garbage.
+    vk_matmul_pipeline pipeline_dequant_mul_mat_mat_fp32[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
     vk_matmul_pipeline pipeline_matmul_id_bf16 {};
@@ -4346,6 +4356,72 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_fp32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
         }
     }
+
+    // Quantized matmul in fp32 arithmetic, selected when the caller asks for
+    // GGML_PREC_F32. Needed only on coopmat devices: cooperative matrices are
+    // fp16, so those paths convert F32 activations to fp16 and saturate values
+    // past 65504, which silently corrupts models whose activations leave fp16
+    // range. Reuses the scalar shaders, so the tile sizes must be scalar too.
+    if (device->coopmat2 || device->coopmat_support) {
+        const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
+
+        l_warptile_mmq = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
+        m_warptile_mmq = { 128,              64,  64, 32, subgroup_size_8,     32, 2, 4, 2, 1, subgroup_size_8 };
+        s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_warptile_wm,       32, 2, 2, 2, 1, subgroup_size_8 };
+
+        l_mmq_wg_denoms = { 128, 128, 1 };
+        m_mmq_wg_denoms = {  64,  64, 1 };
+        s_mmq_wg_denoms = {  32,  32, 1 };
+
+        l_align = 128;
+        m_align =  64;
+        s_align =  32;
+
+        // The mul_mat_{l,m,s} flags were sized for the coopmat tiles, so re-check
+        // the scalar tiles against shared memory and only offer what fits.
+        bool fp32_l[GGML_TYPE_COUNT], fp32_m[GGML_TYPE_COUNT], fp32_s[GGML_TYPE_COUNT];
+        for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const ggml_type t = (ggml_type) i;
+            fp32_s[i] = device->mul_mat_s[i] && ggml_vk_matmul_shmem_support(device, s_warptile_mmq, false, t);
+            fp32_m[i] = device->mul_mat_m[i] && ggml_vk_matmul_shmem_support(device, m_warptile_mmq, false, t);
+            fp32_l[i] = device->mul_mat_l[i] && ggml_vk_matmul_shmem_support(device, l_warptile_mmq, false, t);
+        }
+
+        // ggml_vk_load_shaders is re-entered to compile pipelines on demand, so the
+        // family must be created only once: replacing it would drop the pipeline the
+        // caller already marked as needed and leave it uncompiled.
+#define CREATE_MM_FP32(TYPE, NAMELC) \
+        if (fp32_s[TYPE] || fp32_m[TYPE] || fp32_l[TYPE]) { \
+            if (!device->pipeline_dequant_mul_mat_mat_fp32[TYPE]) { \
+                device->pipeline_dequant_mul_mat_mat_fp32[TYPE] = std::make_shared<vk_matmul_pipeline_struct>(); \
+                device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->scalar = true; \
+            } \
+            if (fp32_l[TYPE]) { \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->l,   #NAMELC "_fp32_l", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, l_warptile_mmq, 1); \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->a_l, #NAMELC "_fp32_aligned_l", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_mmq_wg_denoms, l_warptile_mmq, l_align); \
+            } \
+            if (fp32_m[TYPE]) { \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->m,   #NAMELC "_fp32_m", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq, 1); \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->a_m, #NAMELC "_fp32_aligned_m", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq, m_align); \
+            } \
+            if (fp32_s[TYPE]) { \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->s,   #NAMELC "_fp32_s", NAMELC ## _fp32_len, NAMELC ## _fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq, 1); \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_fp32[TYPE]->a_s, #NAMELC "_fp32_aligned_s", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_mmq_wg_denoms, s_warptile_mmq, s_align); \
+            } \
+        }
+
+        CREATE_MM_FP32(GGML_TYPE_Q4_0, matmul_q4_0_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q4_1, matmul_q4_1_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q5_0, matmul_q5_0_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q5_1, matmul_q5_1_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q8_0, matmul_q8_0_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q2_K, matmul_q2_k_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q3_K, matmul_q3_k_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q4_K, matmul_q4_k_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q5_K, matmul_q5_k_f32)
+        CREATE_MM_FP32(GGML_TYPE_Q6_K, matmul_q6_k_f32)
+#undef CREATE_MM_FP32
+    }
 #undef CREATE_MM
 
     // mul mat vec
@@ -6598,6 +6674,15 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
             return nullptr;
     }
 
+    // GGML_PREC_F32 keeps the activations in F32: the coopmat paths multiply in
+    // fp16, which clamps anything past 65504, so prefer the scalar fp32 pipelines
+    // when this device has them.
+    if (prec == GGML_PREC_F32 && src1_type == GGML_TYPE_F32 &&
+        ctx->device->pipeline_dequant_mul_mat_mat_fp32[src0_type] &&
+        !ctx->device->pipeline_dequant_mul_mat_mat_fp32[src0_type]->is_empty()) {
+        return ctx->device->pipeline_dequant_mul_mat_mat_fp32[src0_type];
+    }
+
     if (ctx->device->coopmat2) {
         assert(src1_type == GGML_TYPE_F16);
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
@@ -7587,7 +7672,14 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
-    if (ctx->device->coopmat2) {
+    // A scalar family on a coopmat2 device (the GGML_PREC_F32 quantized path) is tiled
+    // like the scalar shaders it holds, so the coopmat2 crossovers below do not apply
+    // and the tile sizes it offers come from the family, not from device->mul_mat_*.
+    const bool has_l = mmp->scalar ? mmp->l != nullptr : ctx->device->mul_mat_l[src0_type];
+    const bool has_m = mmp->scalar ? mmp->m != nullptr : ctx->device->mul_mat_m[src0_type];
+    const bool has_s = mmp->scalar ? mmp->s != nullptr : ctx->device->mul_mat_s[src0_type];
+
+    if (ctx->device->coopmat2 && !mmp->scalar) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
         const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
@@ -7603,27 +7695,27 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
                             // split_k==3 with large tiles likely better than medium tiles with no split_k.
                             (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
 
-        if ((ctx->device->mul_mat_l[src0_type] && (n > crossover_large && prefer_large)) || (!ctx->device->mul_mat_m[src0_type] && !ctx->device->mul_mat_s[src0_type])) {
+        if ((has_l && (n > crossover_large && prefer_large)) || (!has_m && !has_s)) {
             return aligned ? mmp->a_l : mmp->l;
         }
         // Use medium shader when the N dimension is greater than the small shader's tile size
         uint32_t crossover_medium = mmp->s->wg_denoms[1];
-        if ((ctx->device->mul_mat_m[src0_type] && (n > crossover_medium)) || !ctx->device->mul_mat_s[src0_type]) {
+        if ((has_m && (n > crossover_medium)) || !has_s) {
             return aligned ? mmp->a_m : mmp->m;
         }
         return aligned ? mmp->a_s : mmp->s;
     }
 
-    if ((ctx->device->mul_mat_s[src0_type] && (m <= 32 || n <= 32)) || (!ctx->device->mul_mat_m[src0_type] && !ctx->device->mul_mat_l[src0_type])) {
+    if ((has_s && (m <= 32 || n <= 32)) || (!has_m && !has_l)) {
         return aligned ? mmp->a_s : mmp->s;
     }
-    if ((ctx->device->mul_mat_m[src0_type] && (m <= 64 || n <= 64)) || !ctx->device->mul_mat_l[src0_type]) {
+    if ((has_m && (m <= 64 || n <= 64)) || !has_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
     // Adreno (Qualcomm) Vulkan crashes on the matmul `_l` (large, BLOCK_SIZE=128)
     // tile; fall back to the `_m` tile (BLOCK_SIZE=64, known-good). Cost: ~4x more
     // dispatches on Adreno; no correctness change.
-    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM && ctx->device->mul_mat_m[src0_type]) {
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM && has_m) {
         return aligned ? mmp->a_m : mmp->m;
     }
     // ARM Mali has few shader cores; the large (128x128) tile leaves
@@ -7632,12 +7724,12 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // (64x64) tile roughly quadruples the workgroup count and cuts the parakeet
     // Vulkan encoder ~18% (1.86x -> 2.26x vs CPU on Mali-G715 / Pixel 9); the
     // whisper encoder drops ~18% too. Mirrors the Qualcomm fallback above.
-    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->mul_mat_m[src0_type]) {
+    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && has_m) {
         return aligned ? mmp->a_m : mmp->m;
     }
     // Samsung Xclipse (RDNA2 mobile): the `_l` tile's 128 fp32 accumulators/thread
     // throttle occupancy on wide-K GEMMs; `_m` cuts the LavaSR enhancer GEMM ~10% e2e.
-    if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && ctx->device->mul_mat_m[src0_type]) {
+    if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && has_m) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
@@ -7996,18 +8088,26 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_prec prec = (ggml_prec) dst->op_params[0];
 
     // Rewriting f32 sources to f16 is a throughput choice for coopmat2, so it must not
-    // override an explicit GGML_PREC_F32 on an f32 x f32 matmul: that asks for f32
-    // arithmetic, and the rewrite would halve the operand precision before the multiply
-    // ever happens. Skipping it sends the op to the scalar fp32 matmul built alongside the
-    // coopmat pipelines.
+    // override an explicit GGML_PREC_F32: that asks for f32 arithmetic, and the rewrite
+    // would halve the operand precision before the multiply ever happens. It also clamps
+    // activations at 65504. Skipping it sends the op to a scalar fp32 matmul instead.
     //
-    // Only f32 x f32 is exempt, because it is the one combination with an f32-source
-    // pipeline to fall back to. A coopmat2 build has no f16-source-with-f32-src1 matmul
-    // (pipeline_matmul_f16_f32 is never created there), so exempting those would resolve
-    // to a null pipeline; they keep the rewrite and still get the f32 accumulator via prec.
+    // f32 x f32 has the scalar fp32 matmul built alongside the coopmat pipelines.
     const bool prec_f32_f32 = prec == GGML_PREC_F32 &&
                               src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
-    const bool coopmat2_f32_to_f16 = ctx->device->coopmat2 && !prec_f32_f32;
+
+    // A quantized src0 has the scalar fp32 dequant matmul, where keeping src1 in f32 lets
+    // the activations reach the shader unclamped. Only opt out when that pipeline exists
+    // for this src0 type, since otherwise the fp16 path is the only one available.
+    const bool keep_src1_f32 = prec == GGML_PREC_F32 && src1->type == GGML_TYPE_F32 &&
+                               ggml_is_quantized(src0->type) &&
+                               ctx->device->pipeline_dequant_mul_mat_mat_fp32[src0->type] &&
+                               !ctx->device->pipeline_dequant_mul_mat_mat_fp32[src0->type]->is_empty();
+
+    // f16 x f32 is what remains, and a coopmat2 build has no f16-source-with-f32-src1
+    // matmul (pipeline_matmul_f16_f32 is never created there), so exempting it would
+    // resolve to a null pipeline; it keeps the rewrite and gets the f32 accumulator via prec.
+    const bool coopmat2_f32_to_f16 = ctx->device->coopmat2 && !prec_f32_f32 && !keep_src1_f32;
 
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
     const bool x_non_contig = (coopmat2_f32_to_f16 && src0->type == GGML_TYPE_F32) ||
