@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES  // For M_PI on MSVC
+
 // vae-decode: load the REAL ACE-Step Oobleck VAE decoder weights (GGUF) and run a
 // full decode on the CPU backend, writing a 48 kHz stereo WAV.
 //
