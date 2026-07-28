@@ -8476,7 +8476,16 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+
+    // Quantizing the activations to q8_1 loses range: block_q8_1.ds is an f16vec2 and
+    // quantize_q8_1.comp stores f16vec2(vec2(d, sum * d)) into it, so past fp16 range
+    // that second component saturates to inf and the dot products that consume it (all
+    // legacy quants but q8_0, the k-quants, iq1) go to NaN. That is precisely the
+    // failure GGML_PREC_F32 exists to prevent, so skip mmvq when it is requested.
+    // Falling back is safe and stays in F32 the whole way: f16_f32_kernel above is true
+    // for an F32 src1, and the mul_mat_vec shaders are generated with FLOAT_TYPE=float.
+    const ggml_prec prec = (ggml_prec) dst->op_params[0];
+    bool quantize_y = prec != GGML_PREC_F32 && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -8993,7 +9002,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // See ggml_vk_mul_mat_vec_q_f16: q8_1's fp16 ds pair cannot hold the activations a
+    // GGML_PREC_F32 caller is asking to preserve.
+    bool quantize_y = (ggml_prec)dst->op_params[0] != GGML_PREC_F32 && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -9253,7 +9264,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+
+    // See ggml_vk_mul_mat_vec_q_f16: q8_1's fp16 ds pair cannot hold the activations a
+    // GGML_PREC_F32 caller is asking to preserve.
+    bool quantize_y = (ggml_prec)dst->op_params[0] != GGML_PREC_F32 && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
