@@ -694,8 +694,8 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
-    // fp32-arithmetic F32xF32 variant for GGML_PREC_F32 (only created when the
-    // default pipeline above would multiply in fp16, i.e. scalar path + device fp16)
+    // fp32-arithmetic F32xF32 variant for GGML_PREC_F32, created whenever the default
+    // pipeline above would multiply in fp16: scalar path + device fp16, coopmat1, coopmat2
     vk_matmul_pipeline pipeline_matmul_f32_fp32 {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
@@ -4292,11 +4292,21 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
     }
     // reusing CREATE_MM from the fp32 path
-    if ((device->coopmat2 || device->coopmat_support)
+    const bool need_scalar_bf16 = (device->coopmat2 || device->coopmat_support)
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         && !device->coopmat_bf16_support
 #endif
-        ) {
+        ;
+
+    // GGML_PREC_F32 on an f32 x f32 matmul asks for f32 arithmetic, and neither coopmat
+    // path can supply it: both multiply f32 sources in fp16, and coopmat2 additionally
+    // rewrites the operands to f16 in ggml_vk_mul_mat_q_f16. Build the scalar fp32 matmul
+    // alongside the coopmat pipelines so the GGML_PREC_F32 lookup in
+    // ggml_vk_get_mul_mat_mat_pipeline has something to return. The scalar fp16 branch
+    // above creates its own copy, and the scalar fp32 branch is already f32 throughout.
+    const bool need_scalar_f32_matmul = device->coopmat2 || device->coopmat_support;
+
+    if (need_scalar_bf16 || need_scalar_f32_matmul) {
         const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
 
         // use scalar tile sizes
@@ -4313,8 +4323,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, 4, 4, 1, subgroup_size_8 };
         }
 
-        CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
-        CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+        if (need_scalar_bf16) {
+            CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+            CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
+        }
+
+        if (need_scalar_f32_matmul) {
+            if (!device->pipeline_matmul_f32_fp32) {
+                device->pipeline_matmul_f32_fp32 = std::make_shared<vk_matmul_pipeline_struct>();
+            }
+            CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_fp32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, , 0);
+        }
     }
 #undef CREATE_MM
 
@@ -7961,10 +7980,26 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
+    const ggml_prec prec = (ggml_prec) dst->op_params[0];
+
+    // Rewriting f32 sources to f16 is a throughput choice for coopmat2, so it must not
+    // override an explicit GGML_PREC_F32 on an f32 x f32 matmul: that asks for f32
+    // arithmetic, and the rewrite would halve the operand precision before the multiply
+    // ever happens. Skipping it sends the op to the scalar fp32 matmul built alongside the
+    // coopmat pipelines.
+    //
+    // Only f32 x f32 is exempt, because it is the one combination with an f32-source
+    // pipeline to fall back to. A coopmat2 build has no f16-source-with-f32-src1 matmul
+    // (pipeline_matmul_f16_f32 is never created there), so exempting those would resolve
+    // to a null pipeline; they keep the rewrite and still get the f32 accumulator via prec.
+    const bool prec_f32_f32 = prec == GGML_PREC_F32 &&
+                              src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+    const bool coopmat2_f32_to_f16 = ctx->device->coopmat2 && !prec_f32_f32;
+
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+    const bool x_non_contig = (coopmat2_f32_to_f16 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    const bool y_non_contig = (coopmat2_f32_to_f16 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
                               !ggml_vk_dim01_contiguous(src1);
 
@@ -7973,14 +8008,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // Quantizing src1 to q8_1 is likewise a throughput choice that GGML_PREC_F32 rules out.
+    bool quantize_y = ctx->device->integer_dot_product && prec != GGML_PREC_F32 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, prec) : nullptr;
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, prec);
         quantize_y = false;
     }
 
@@ -7995,7 +8031,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
     }
 
     // Not implemented
@@ -10394,8 +10430,6 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     const uint32_t a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     const uint32_t b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
     const uint32_t d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
-
-    GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || (a_offset == 0 && b_offset == 0 && d_offset == 0));
 
     p.misalign_offsets = (a_offset << 16) | (b_offset << 8) | d_offset;
 

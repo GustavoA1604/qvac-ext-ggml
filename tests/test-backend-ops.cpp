@@ -2171,13 +2171,13 @@ struct test_get_rows : public test_case {
     const int r; // rows to get
     const int be1; // batch size
     const int be2; // batch size
-    const bool v; // view (non-contiguous src1)
+    const int v; // 0: none, 1: view of src1, 2: view of src1 at a non-zero offset
 
     std::string vars() override {
         return VARS_TO_STR7(type, n, m, r, be1, be2, v);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, int v = 0)
         : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2186,9 +2186,18 @@ struct test_get_rows : public test_case {
 
         ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
         ggml_set_name(rows, "rows");
-        if (v) {
+        if (v == 1) {
             rows = ggml_view_3d(ctx, rows, r/2, be1, be2, rows->nb[1], rows->nb[2], 0);
             ggml_set_name(rows, "view_of_rows");
+        } else if (v == 2) {
+            // Index slice starting at a non-zero offset, as produced by
+            // per-codebook views of one id tensor. Backends that bind
+            // storage buffers at an aligned offset and carry the remainder
+            // separately (Vulkan) only exercise that path when the view
+            // offset is not a multiple of the binding alignment.
+            rows = ggml_view_3d(ctx, rows, r/2, be1, be2, rows->nb[1], rows->nb[2],
+                                ggml_element_size(rows));
+            ggml_set_name(rows, "offset_view_of_rows");
         }
 
         const bool grad_supported = ggml_is_matrix(in) && ggml_is_vector(rows);
@@ -4042,6 +4051,16 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err() override {
+        // An explicit GGML_PREC_F32 on an f32 x f32 matmul has to be computed in f32, so
+        // hold it to an f32-grade bound. The 5e-4 default cannot tell the two apart: a
+        // backend that multiplies the operands in fp16 still passes it comfortably, which
+        // is how that class of bug goes unnoticed. Measured on Vulkan/NV_coopmat2, these
+        // cases sit at <=1e-11 when computed in f32 and at 6.9e-8 when the operands are
+        // silently narrowed to fp16, so 1e-9 sits about two orders of magnitude clear of
+        // both.
+        if (prec_f32 && type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32) {
+            return 1e-9;
+        }
         return 5e-4;
     }
 
@@ -7638,23 +7657,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
-        test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
-        test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
-        test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
+        test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, 0));
+        test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, 0));
+        test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, 0));
     }
 
-    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, 0));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
-            for (bool v : {false, true}) {
+            for (int v : {0, 1, 2}) {
                 test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, b, 1, v));
             }
         }
     }
     for (int b : {1, 7}) {
-        for (bool v : {false, true}) {
+        for (int v : {0, 1, 2}) {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
         }
+    }
+    // Single-row index slices at successive element offsets: the shape Parler's
+    // per-codebook embedding lookups produce, and the one that leaves the index
+    // tensor misaligned against the storage-buffer binding alignment.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_get_rows(type, 1024, 1088, 2, 1, 1, 2));
     }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
@@ -8442,6 +8467,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 65, 1, 128, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    // ...and must stay routable for non-f32 weights, where honouring it means the f32
+    // accumulator rather than f32 operands. These combinations have no f32-source pipeline,
+    // so a backend that exempts them from its reduced-precision path resolves to nothing.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 33, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
