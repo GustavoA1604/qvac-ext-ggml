@@ -7872,6 +7872,19 @@ static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
         (tensor->ne[3] == 1 || tensor->nb[3] == tensor->nb[2]*tensor->ne[2]);
 }
 
+// Channel (dim 2) stride in elements, for a tensor the matmul shaders read in place.
+//
+// Note what ggml_vk_dim01_contiguous above does *not* say: when ne[3] == 1 it never
+// inspects nb[2]. A view into a larger allocation -- a KV-cache window being the
+// motivating case, where only the live rows are viewed but the channel stride still
+// spans max_seq rows -- therefore passes as contiguous while its channels remain
+// strided. Assuming ne[0]*ne[1] for such a tensor makes every channel past the first
+// read the previous channel's rows. Whenever the channels really are packed,
+// nb[2] == ne[0]*ne[1]*type_size/blck_size and this returns exactly ne[0]*ne[1].
+static uint32_t ggml_vk_channel_stride_elements(const ggml_tensor * tensor) {
+    return (uint32_t) ((tensor->nb[2] * ggml_blck_size(tensor->type)) / ggml_type_size(tensor->type));
+}
+
 static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * dst, ggml_type to) {
 
     // Choose "contiguous copy" shader if src/dst are contiguous
@@ -8335,12 +8348,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
-    uint32_t stride_batch_x = ne00*ne01;
+    // When src0 is dequantized/reformatted it lands in a packed scratch buffer, so
+    // ne00*ne01 is right; otherwise the shader reads it in place and has to be told the
+    // real channel stride. See ggml_vk_channel_stride_elements.
+    uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_channel_stride_elements(src0);
     uint32_t stride_batch_y = ne10*ne11;
-
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
-        stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
-    }
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
@@ -8611,13 +8623,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
-    uint32_t stride_batch_x = batch_n ? 0 : ne00*ne01;
+    // Outside that case, a src0 read in place needs its real channel stride rather than a
+    // packed one -- see ggml_vk_channel_stride_elements.
+    uint32_t stride_batch_x = batch_n ? 0 : (qx_needs_dequant ? ne00*ne01 : ggml_vk_channel_stride_elements(src0));
     uint32_t stride_batch_y = batch_n ? ne10 : (ne10*ne11);
     uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
-
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
-        stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
-    }
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
@@ -9197,12 +9207,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     ggml_vk_sync_buffers(ctx, subctx);
 
-    uint32_t stride_batch_x = ne00*ne01;
+    // Here the "batch" index is the expert index, but the stride is still src0's channel
+    // stride -- see ggml_vk_channel_stride_elements.
+    uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_channel_stride_elements(src0);
     uint32_t stride_batch_y = ne10*ne11;
-
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
-        stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
-    }
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
