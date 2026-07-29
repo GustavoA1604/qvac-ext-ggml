@@ -4166,6 +4166,142 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_PREC_F32 on a quantized weight, with activations deliberately outside fp16
+// range. test_mul_mat cannot cover this: it initializes every tensor in [-1, 1], so a
+// backend that honours the request by converting the activations to fp16 clamps at
+// 65504 without any test noticing. strided_b additionally denies the backend a
+// directly usable src1, so the reformat it inserts has to stay in F32 as well.
+struct test_mul_mat_prec_f32 : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool strided_b;
+    const float b_absmax;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, n, k, strided_b, b_absmax);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_prec_f32(ggml_type type_a, int64_t m, int64_t n, int64_t k,
+            bool strided_b = false, float b_absmax = 1.0e5f)
+        : type_a(type_a), m(m), n(n), k(k), strided_b(strided_b), b_absmax(b_absmax) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        // Over-allocate the row so the view's row stride exceeds its row length, which
+        // is what backends test for when deciding whether src1 needs repacking.
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided_b ? k + 32 : k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * b_in = strided_b ? ggml_view_2d(ctx, b, k, n, b->nb[1], 0) : b;
+        ggml_set_name(b_in, "b_in");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b_in);
+        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;  // writing through a strided view would not respect its layout
+            }
+            if (strcmp(ggml_get_name(t), "b") == 0) {
+                init_tensor_uniform(t, -b_absmax, b_absmax);
+            } else {
+                // The weight stays in [-1, 1]: its block scales would absorb a wide
+                // range and the products would land back inside fp16.
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// src0 as a view into a taller allocation, so consecutive channels sit m_alloc rows apart
+// while only m of each are live. Nothing about dims 0 and 1 is unusual, which is the point:
+// a backend that decides "this is contiguous" from nb[0]/nb[1] alone will also assume the
+// channels are packed and read channel c's rows from channel c-1. A KV-cache window viewed
+// out of a max_seq-row cache has exactly this shape, and test_mul_mat's k_v cannot produce
+// it -- that makes the view non-contiguous along k, which backends already handle.
+struct test_mul_mat_strided_channels : public test_case {
+    const ggml_type type_a;
+    const int64_t m;        // rows exposed per channel
+    const int64_t m_alloc;  // rows allocated per channel; > m is what strides nb[2]
+    const int64_t n;
+    const int64_t k;
+    const int64_t channels;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, m_alloc, n, k, channels);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k * channels;
+    }
+
+    test_mul_mat_strided_channels(ggml_type type_a, int64_t m, int64_t m_alloc, int64_t n, int64_t k,
+            int64_t channels)
+        : type_a(type_a), m(m), m_alloc(m_alloc), n(n), k(k), channels(channels) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a_full = ggml_new_tensor_3d(ctx, type_a, k, m_alloc, channels);
+        ggml_set_name(a_full, "a_full");
+
+        // Same nb[1]/nb[2] as the parent, fewer rows: dims 0 and 1 stay packed, nb[2] does not.
+        ggml_tensor * a = ggml_view_3d(ctx, a_full, k, m, channels, a_full->nb[1], a_full->nb[2], 0);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, channels);
+        ggml_set_name(b, "b");
+
+        // n > 1 keeps this on the tiled matmul rather than the mul_mat_vec paths.
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            // The rows past the view get real values too, so reading the wrong channel
+            // produces a wrong result rather than a conveniently zero one.
+            init_tensor_uniform(t);
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -8467,13 +8603,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 65, 1, 128, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
-    // ...and must stay routable for non-f32 weights, where honouring it means the f32
-    // accumulator rather than f32 operands. These combinations have no f32-source pipeline,
-    // so a backend that exempts them from its reduced-precision path resolves to nothing.
+    // ...and must stay routable for an f16 weight, where honouring it means the f32
+    // accumulator rather than f32 operands. That combination has no f32-source pipeline,
+    // so a backend that exempts it from its reduced-precision path resolves to nothing.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 33, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    // A quantized weight does have one, via the dequantizing matmul. Models with
+    // activations outside fp16 range need fp32 arithmetic here too, and backends may reach
+    // it with a different pipeline family than the default one (small/medium/large tile
+    // and aligned variants), so sweep shapes that select across those families.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1056, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 33, 129, 256, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 65, 1, 256, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    }
+    // The cases above cannot detect an fp16 conversion, since their activations fit in
+    // fp16 either way. These do: n=63 goes through the matmul kernels, n=1 through the
+    // mul_mat_vec ones, and strided_b makes the backend repack the activations first.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (bool strided_b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type_a, 512, 63, 512, strided_b));
+            test_cases.emplace_back(new test_mul_mat_prec_f32(type_a, 512,  1, 512, strided_b));
+        }
+    }
+    // k that no tile alignment divides, to reach the unaligned matmul variants
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
+
+    // Multi-channel src0 whose channels are strided over more rows than the view exposes.
+    // F16 is the KV-cache case; the quantized ones additionally check that the channel
+    // stride is converted to elements using the block size rather than the type size.
+    for (int64_t channels : {2, 8}) {
+        test_cases.emplace_back(new test_mul_mat_strided_channels(GGML_TYPE_F16,  32, 96, 16, 256, channels));
+        test_cases.emplace_back(new test_mul_mat_strided_channels(GGML_TYPE_Q8_0, 32, 96, 16, 256, channels));
+        test_cases.emplace_back(new test_mul_mat_strided_channels(GGML_TYPE_Q4_K, 32, 96, 16, 256, channels));
+    }
+    // Row counts that are not tile multiples, and a single live row out of many allocated.
+    test_cases.emplace_back(new test_mul_mat_strided_channels(GGML_TYPE_F16, 17, 129, 33, 288, 3));
+    test_cases.emplace_back(new test_mul_mat_strided_channels(GGML_TYPE_F16,  1, 512, 16, 256, 4));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
