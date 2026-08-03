@@ -4602,6 +4602,8 @@ static bool ggml_cl_im2col_single_use(const struct ggml_cgraph * cgraph, int idx
 static bool ggml_cl_can_fuse_im2col_mul_mat(const ggml_backend_opencl_context * backend_ctx,
                                             const ggml_tensor * im2col, const ggml_tensor * mm);
 static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml_tensor * im2col, ggml_tensor * mm);
+static void ggml_cl_mulmat_trace(const ggml_tensor * src0, const ggml_tensor * src1,
+                                 const ggml_tensor * dst, const char * path);
 
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
@@ -11802,10 +11804,13 @@ static bool ggml_cl_can_fuse_im2col_mul_mat(const ggml_backend_opencl_context * 
     if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) return false;
     if (mm->ne[2] != 1 || mm->ne[3] != 1) return false;
 
+    // M needs no alignment: the fused path builds A into a scratch buffer padded up
+    // to a multiple of 4 rows, and the GEMM takes A's stride separately from dst's.
     const int64_t K = a->ne[0], M = a->ne[1], N = mm->ne[1];
+    const int64_t M_pad = (M + 3) & ~(int64_t) 3;
     if (K != im2col->ne[0] || M != im2col->ne[1]) return false;
-    if (K % 32 != 0 || M % 4 != 0 || N < 1) return false;
-    if ((size_t) K * M / 4 > backend_ctx->image_max_buffer_size) return false;
+    if (K % 32 != 0 || M < 1 || N < 1) return false;
+    if ((size_t) K * M_pad / 4 > backend_ctx->image_max_buffer_size) return false;
     if ((size_t) K * (N + 8) / 4 > backend_ctx->image_max_buffer_size) return false;
     return true;
 #else
@@ -11814,7 +11819,12 @@ static bool ggml_cl_can_fuse_im2col_mul_mat(const ggml_backend_opencl_context * 
 #endif
 }
 
-static void ggml_cl_mul_mat_f32_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// `n_cols` is the GEMM's N.  It is dst->ne[1] for a plain 2-D matmul, and the
+// FLATTENED column count ne1*ne12*ne13 when a 2-D weight is broadcast over
+// src1's higher dims -- see the routing gate in ggml_cl_mul_mat for why that
+// flattening is exact.
+static void ggml_cl_mul_mat_f32_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int64_t n_cols,
+                                           cl_ulong slice0 = 0, cl_ulong slice1 = 0, cl_ulong sliced = 0) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(src0 && src0->extra);
     GGML_ASSERT(src1 && src1->extra);
@@ -11828,13 +11838,14 @@ static void ggml_cl_mul_mat_f32_f32_adreno(ggml_backend_t backend, const ggml_te
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
-    cl_ulong offset0 = extra0->offset + src0->view_offs;
-    cl_ulong offset1 = extra1->offset + src1->view_offs;
-    cl_ulong offsetd = extrad->offset + dst->view_offs;
+    // slice* select one 2-D plane of a batched GEMM; 0 for the plain 2-D case.
+    cl_ulong offset0 = extra0->offset + src0->view_offs + slice0;
+    cl_ulong offset1 = extra1->offset + src1->view_offs + slice1;
+    cl_ulong offsetd = extrad->offset + dst->view_offs  + sliced;
 
     const int M = src0->ne[1];
     const int K = src0->ne[0];
-    const int N = dst->ne[1];
+    const int N = (int) n_cols;
 
     cl_context context = backend_ctx->context;
     cl_int           err;
@@ -11917,9 +11928,10 @@ static void ggml_cl_mul_mat_f32_f32_adreno(ggml_backend_t backend, const ggml_te
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),      &K));
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &M));
-        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &padded_N));
-        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &N));
-        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &M));   // A is already 4-aligned here
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &padded_N));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &N));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_ulong), &offsetd));
 
         size_t gws[] = { (size_t) CEIL_DIV(N, 8), (size_t) CEIL_DIV(M, 4), 1 };
         size_t lws[] = { 2, 128, 1 };
@@ -11973,6 +11985,12 @@ static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml
 
     const int padding  = (N % 8) ? (8 - (N % 8)) : 0;
     const int padded_N = N + padding;
+    // The GEMM reads A in float4s down the M axis, so round A's stride up to 4 and let
+    // the im2col zero-fill the slack. dst keeps its true M stride.
+    const int padded_M = (M + 3) & ~3;
+
+    ggml_cl_mulmat_trace(mm->src[0], b, mm, padded_M == M ? "im2col_f32_adreno_fused"
+                                                          : "im2col_f32_adreno_fused_mpad");
 
     cl_context context = backend_ctx->context;
     cl_int           err;
@@ -11989,7 +12007,7 @@ static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml
     // ---- A transposed, built straight from the signal (no im2col matrix) ----
     // at[chw][ix] = sig[ic*delta + ix*s0 + kx*d0 - p0]; contiguous in ix on both sides.
     region.origin = 0;
-    region.size   = (size_t) K * M * sizeof(float);
+    region.size   = (size_t) K * padded_M * sizeof(float);
     backend_ctx->prealloc_wt_trans.allocate(context, region.size);
     CL_CHECK((at_sub = clCreateSubBuffer(backend_ctx->prealloc_wt_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
     {
@@ -12003,13 +12021,13 @@ static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml
         CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &IC));
         CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &M));
         CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &KW));
-        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &M));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &padded_M));
         CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &delta_offset));
         CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &s0));
         CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &p0));
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &d0));
         size_t lws[2] = { 64, 1 };
-        size_t gws[2] = { (size_t) ((M + 63) / 64) * 64, (size_t) K };
+        size_t gws[2] = { (size_t) ((padded_M + 63) / 64) * 64, (size_t) K };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, mm);
     }
 
@@ -12049,9 +12067,10 @@ static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),      &K));
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &M));
-        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &padded_N));
-        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &N));
-        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &padded_M));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &padded_N));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &N));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_ulong), &offsetd));
         size_t gws[] = { (size_t) CEIL_DIV(N, 8), (size_t) CEIL_DIV(M, 4), 1 };
         size_t lws[] = { gws[0] >= 2 ? 2u : 1u, 128, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, mm);
@@ -12841,6 +12860,27 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
+// GGML_OPENCL_MULMAT_TRACE=1 prints one line per MUL_MAT dispatch with the real
+// shapes and the path actually taken.  Which tier a matmul lands on is decided by
+// a stack of shape gates, and "the shapes should clear the gate" is exactly the
+// kind of thing that turns out to be false -- print it, do not infer it.
+static bool ggml_cl_mulmat_trace_enabled() {
+    static const bool e = [] {
+        const char * v = getenv("GGML_OPENCL_MULMAT_TRACE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return e;
+}
+static void ggml_cl_mulmat_trace(const ggml_tensor * src0, const ggml_tensor * src1,
+                                 const ggml_tensor * dst, const char * path) {
+    if (!ggml_cl_mulmat_trace_enabled()) return;
+    GGML_LOG_INFO("[cl-mm] %s x %s -> %s | src0 %ldx%ldx%ldx%ld src1 %ldx%ldx%ldx%ld dst %ldx%ldx%ldx%ld | %s\n",
+        ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
+        (long)src0->ne[0], (long)src0->ne[1], (long)src0->ne[2], (long)src0->ne[3],
+        (long)src1->ne[0], (long)src1->ne[1], (long)src1->ne[2], (long)src1->ne[3],
+        (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3], path);
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -12938,14 +12978,54 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 
     // f32 x f32 has no Adreno matmul tier; route the shapes the image kernel can take
-    // (2-D, K%32, M%4, N>1, contiguous, within the image size limit) onto it.
+    // (2-D weight, K%32, M%4, N>1, contiguous, within the image size limit) onto it.
+    //
+    // src1/dst may carry higher dims as long as the WEIGHT is 2-D (ne02==ne03==1,
+    // i.e. one matrix broadcast over every batch).  With src1 and dst contiguous,
+    // src1(k,n,b) lives at k + n*K + b*K*ne1 and dst(m,n,b) at m + n*M + b*M*ne1,
+    // so folding the higher dims into N' = ne1*ne12*ne13 addresses exactly the same
+    // bytes in the same order -- a reinterpretation, not a reshape, and therefore
+    // bit-identical to the 2-D case.  This is what puts a batched transformer stack
+    // (classifier-free guidance, beam search, multi-speaker) on the image GEMM
+    // instead of the generic mul_mm_f32_f32_l4_lm.
+    const int64_t ne_cols = (int64_t) ne1 * ne12 * ne13;
     if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32 &&
-        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+        ne02 == 1 && ne03 == 1 &&
+        ne00 % 32 == 0 && ne01 % 4 == 0 && ne_cols > 1 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        (size_t) ne00 * ne01 / 4 <= backend_ctx->image_max_buffer_size &&
+        (size_t) ne00 * (ne_cols + 8) / 4 <= backend_ctx->image_max_buffer_size) {
+        ggml_cl_mulmat_trace(src0, src1, dst, "f32_f32_adreno_8x4");
+        ggml_cl_mul_mat_f32_f32_adreno(backend, src0, src1, dst, ne_cols);
+        return;
+    }
+
+    // A batched f32 GEMM whose operands share the SAME higher dims is a stack of
+    // independent 2-D GEMMs -- which is exactly what transformer attention scores
+    // are (Q.K^T over heads x batch).  It cannot use the flattening above, because
+    // that requires one broadcast weight and here src0 varies per slice.  Measured
+    // on Adreno 740, these land on kernel_mul_mm_f32_f32_l4_lm at ~3 GFLOP/s while
+    // the image GEMM does the model's 2-D linears at ~400 GFLOP/s, so dispatch the
+    // image GEMM once per slice instead.
+    //
+    // Safe to reuse the shared transpose/staging scratch across the loop: the
+    // OpenCL command queue is created in-order (command_queue_props = 0), so each
+    // slice's GEMM completes before the next slice's transpose overwrites it.
+    if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32 &&
+        ne02 == ne12 && ne03 == ne13 && ((int64_t) ne02 * ne03 > 1) &&
         ne00 % 32 == 0 && ne01 % 4 == 0 && ne1 > 1 &&
-        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
         (size_t) ne00 * ne01 / 4 <= backend_ctx->image_max_buffer_size &&
         (size_t) ne00 * (ne1 + 8) / 4 <= backend_ctx->image_max_buffer_size) {
-        ggml_cl_mul_mat_f32_f32_adreno(backend, src0, src1, dst);
+        ggml_cl_mulmat_trace(src0, src1, dst, "f32_f32_adreno_8x4_sliced");
+        for (int i3 = 0; i3 < ne03; ++i3) {
+            for (int i2 = 0; i2 < ne02; ++i2) {
+                ggml_cl_mul_mat_f32_f32_adreno(backend, src0, src1, dst, ne1,
+                    (cl_ulong) i3 * nb03 + (cl_ulong) i2 * nb02,
+                    (cl_ulong) i3 * nb13 + (cl_ulong) i2 * nb12,
+                    (cl_ulong) i3 * dst->nb[3] + (cl_ulong) i2 * dst->nb[2]);
+            }
+        }
         return;
     }
 
@@ -13297,6 +13377,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         cl_kernel gemm_kernel = NULL;
         if (src0t == GGML_TYPE_F32 && src1t == GGML_TYPE_F32) {
             gemm_kernel = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
+            ggml_cl_mulmat_trace(src0, src1, dst, "generic_mul_mm_f32_f32_l4_lm");
         } else if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F32) {
             gemm_kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
         } else if (src0t == GGML_TYPE_F16 && src1t == GGML_TYPE_F16) {
