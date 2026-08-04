@@ -3763,16 +3763,18 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
 
-    GGML_ASSERT(KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-
-    const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
+    // One threadgroup per output position, threads spread over the CHW columns it writes.
+    // Sizing from the kernel window instead (the previous KH*KW threadgroup) leaves most of
+    // a SIMD group idle for 1-D convolutions, where KH == 1 and KW is small.
+    const int64_t maxtptg = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+    const int64_t ntptg0  = std::min<int64_t>(maxtptg, std::max<int64_t>(32, GGML_PAD(CHW, 32)));
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
+    ggml_metal_encoder_dispatch_threadgroups(enc, OW, OH, N, ntptg0, 1, 1);
 
     return 1;
 }
