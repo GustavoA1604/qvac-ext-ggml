@@ -7941,12 +7941,26 @@ template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q8_0, 2, dequantize_q8_0>;
 
+// K-quants dequantise in 16-element sub-blocks, which is exactly the group size
+// ggml_metal_op_cpy already assumes for a quantised source (nk0 = ne00/16).
+template [[host_name("kernel_cpy_q2_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q6_K, 16, dequantize_q6_K>;
+
 template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_0, 2, dequantize_q4_0>;
 template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+
+template [[host_name("kernel_cpy_q2_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q6_K, 16, dequantize_q6_K>;
 
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
