@@ -4713,6 +4713,16 @@ typedef void (im2col_t)(
         uint3   ntg[[threads_per_threadgroup]]);
 
 template <typename T>
+// One threadgroup per output position (in, ioh, iow); its threads walk that position's
+// CHW columns, which are contiguous in dst. So writes are coalesced and the threadgroup
+// is sized from CHW rather than from the kernel window.
+//
+// The previous mapping put (N, KH, KW) in the threadgroup and (IC, OH, OW) in the grid.
+// For a 1-D convolution KH == 1, and audio models decode a single sequence at a time, so
+// N == 1 and the threadgroup degenerated to KW threads -- 7, or 1 for a pointwise conv --
+// against a 32-wide SIMD group, spread over IC*OW threadgroups. Measured on the ACE-Step
+// VAE decoder that cost ~170 ms per im2col whether KW was 7 or 1, i.e. dispatch-bound
+// rather than bandwidth-bound.
 kernel void kernel_im2col(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,
@@ -4721,46 +4731,33 @@ kernel void kernel_im2col(
         uint3  tgpg[[threadgroups_per_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-//    const int64_t IC = tgpg[0];
+    const int64_t OW = tgpg[0];
     const int64_t OH = tgpg[1];
-    const int64_t OW = tgpg[2];
 
-    const int64_t KH = ntg[1];
-    const int64_t KW = ntg[2];
-
-          int64_t in  = tpitg[0];
-    const int64_t ikh = tpitg[1];
-    const int64_t ikw = tpitg[2];
-
-    const int64_t iic = tgpig[0];
+    const int64_t iow = tgpig[0];
     const int64_t ioh = tgpig[1];
-    const int64_t iow = tgpig[2];
+    const int64_t in  = tgpig[2];
 
-    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
-    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
-
-    int64_t offset_dst = (in*OH*OW + ioh*OW + iow)*args.CHW + (iic*(KH*KW) + ikh*KW + ikw);
+    const int KW  = args.KW;
+    const int KHW = args.KHW;
 
     device T * pdst = (device T *) (dst);
 
-    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
-        while (in < args.N) {
-            pdst[offset_dst] = 0.0f;
-            offset_dst += ntg[0]*args.CHW*OH*OW;
+    const int64_t offset_row = (in*OH*OW + ioh*OW + iow)*args.CHW;
+    const int64_t offset_bat = in*args.ofs0;
 
-            in += ntg[0];
-        }
-    } else {
-        int64_t offset_src = in*args.ofs0 + iic*args.ofs1 + iih*args.IW + iiw;
+    for (int col = tpitg[0]; col < args.CHW; col += ntg[0]) {
+        const int iic = col / KHW;
+        const int rem = col - iic*KHW;
+        const int ikh = rem / KW;
+        const int ikw = rem - ikh*KW;
 
-        while (in < args.N) {
-            pdst[offset_dst] = x[offset_src];
+        const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
+        const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
 
-            offset_dst += ntg[0]*args.CHW*OH*OW;
-            offset_src += ntg[0]*args.ofs0;
-
-            in += ntg[0];
-        }
+        pdst[offset_row + col] = (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW)
+            ? (T) 0
+            : (T) x[offset_bat + iic*args.ofs1 + iih*args.IW + iiw];
     }
 }
 
@@ -7944,12 +7941,26 @@ template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q8_0, 2, dequantize_q8_0>;
 
+// K-quants dequantise in 16-element sub-blocks, which is exactly the group size
+// ggml_metal_op_cpy already assumes for a quantised source (nk0 = ne00/16).
+template [[host_name("kernel_cpy_q2_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q6_K, 16, dequantize_q6_K>;
+
 template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
 template [[host_name("kernel_cpy_q4_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_0, 2, dequantize_q4_0>;
 template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_1, 2, dequantize_q4_1>;
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+
+template [[host_name("kernel_cpy_q2_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q6_K, 16, dequantize_q6_K>;
 
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
