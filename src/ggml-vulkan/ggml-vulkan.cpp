@@ -5485,6 +5485,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        // UMA reads host-visible memory at full speed, so device-local-first only buys a staging
+        // copy. Set here rather than beside the env read above: uma is not known until now.
+        if (device->uma) {
+            device->prefer_host_memory = true;
+        }
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -8223,7 +8228,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    // Read in place: the shader walks channels with the REAL stride
+    // (ggml_vk_channel_stride_elements), so the descriptor range must span the strided
+    // extent. qx_sz counts the view's elements as if packed, which for a strided view
+    // (m_alloc > m) stops short of the last channel, putting those reads outside the
+    // binding. ggml_nbytes() spans nb[] and equals qx_sz when the tensor really is
+    // packed, so this only ever widens the range.
+    const uint64_t x_sz = !qx_needs_dequant ? ggml_nbytes(src0) : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -8308,7 +8319,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     } else {
         d_X = d_Qx;
         x_buf_offset = qx_buf_offset;
-        GGML_ASSERT(qx_sz == x_sz);
+        GGML_ASSERT(x_sz == ggml_nbytes(src0));
     }
     if (qy_needs_dequant) {
         d_Y = ctx->prealloc_y;
@@ -9062,7 +9073,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    // Read in place: the shader walks channels with the REAL stride
+    // (ggml_vk_channel_stride_elements), so the descriptor range must span the strided
+    // extent. qx_sz counts the view's elements as if packed, which for a strided view
+    // (m_alloc > m) stops short of the last channel, putting those reads outside the
+    // binding. ggml_nbytes() spans nb[] and equals qx_sz when the tensor really is
+    // packed, so this only ever widens the range.
+    const uint64_t x_sz = !qx_needs_dequant ? ggml_nbytes(src0) : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t ids_sz = nbi2;
     const uint64_t d_sz = sizeof(float) * d_ne;
@@ -9152,7 +9169,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     } else {
         d_X = d_Qx;
         x_buf_offset = qx_buf_offset;
-        GGML_ASSERT(qx_sz == x_sz);
+        GGML_ASSERT(x_sz == ggml_nbytes(src0));
     }
     if (qy_needs_dequant) {
         d_Y = ctx->prealloc_y;
