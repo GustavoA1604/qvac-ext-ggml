@@ -8693,6 +8693,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
 
+    // The Adreno gemv splits K across waves, and is only selected once both dimensions
+    // reach 384, so every n=1 case above (m=16, k=256) misses it entirely. These reach
+    // it: 896x896 is the shape a small LM's attention projections take, narrow enough
+    // that the launch cannot fill the GPU, and 2052 sits just past the narrow cutoff so
+    // the stock wave count is covered by the same sweep.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 896, 1, 896, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2052, 1, 896, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    }
+
     // Multi-channel src0 whose channels are strided over more rows than the view exposes.
     // F16 is the KV-cache case; the quantized ones additionally check that the channel
     // stride is converted to elements using the block size rather than the type size.

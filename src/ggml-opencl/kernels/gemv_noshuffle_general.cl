@@ -265,8 +265,9 @@ __kernel void kernel_gemv_noshuffle(
     if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
     if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
 
-    // 2 outputs per fiber in wave 0
-    if (groupId == 0) {
+    // 2 outputs per fiber in wave 0. Dim 0 is rounded up to a whole wave, so the last
+    // wave runs past M whenever M/2 is not a multiple of the wave size.
+    if (groupId == 0 && gid * 2 < M) {
         dst = (global float*)((global char*)dst + offsetd);
         vstore2(totalSum, 0, &(dst[gid * 2]));
     }
