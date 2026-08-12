@@ -4850,6 +4850,31 @@ static bool gemv_prefers_wide(const ggml_backend_opencl_context * backend_ctx, i
            k_blocks >= backend_ctx->gemv_wide_simdgroups;
 }
 
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+// Runs the matmul, folding fuse_add into the store epilogue if the routing reaches a path
+// that can do it. Sets *fused only when the ADD was actually absorbed; every other path
+// writes dst on its own and leaves it false, so the caller must still run the ADD then.
+static void ggml_cl_mul_mat_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1,
+                                 ggml_tensor * dst, ggml_tensor * fuse_add, bool * fused);
+
+// The addend of an ADD that the xmem store epilogue can absorb, or nullptr. ggml_can_fuse
+// has already established adjacency, that the MUL_MAT feeds the ADD, that it has no other
+// consumer, and that the two share a shape.
+static const ggml_tensor * ggml_cl_xmem_store_fused_addend(const ggml_tensor * mul_mat, const ggml_tensor * add) {
+    const ggml_tensor * acc = add->src[0] == mul_mat ? add->src[1] : add->src[0];
+
+    if (add->type != GGML_TYPE_F32 || acc->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    // The epilogue addresses the addend with the destination's own linear index, so it has
+    // to match element for element: no broadcast and no strides of its own.
+    if (!ggml_are_same_shape(acc, add) || !ggml_is_contiguous(acc) || !ggml_is_contiguous(add)) {
+        return nullptr;
+    }
+    return acc;
+}
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -4903,6 +4928,24 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             i++;
             continue;
         }
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+        // A convolution decomposed into per-tap matmuls sums the taps with ADD. The xmem
+        // store already writes the matmul's result, so it can add the running sum there
+        // and save a full read-read-write pass. Only that path can absorb it, so the
+        // matmul reports back whether it did and the ADD still runs when it did not.
+        if (!backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            ggml_tensor * add = cgraph->nodes[i+1];
+            if (ggml_cl_xmem_store_fused_addend(node, add) != nullptr) {
+                bool fused = false;
+                ggml_cl_mul_mat_impl(backend, node->src[0], node->src[1], node, add, &fused);
+                if (fused) {
+                    i++;
+                }
+                continue;
+            }
+        }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
         bool ok = ggml_cl_compute_forward(backend, node);
         if (!ok) {
@@ -11519,12 +11562,16 @@ static bool ggml_cl_can_use_adreno_xmem_gemm_swapped(
     return true;
 }
 
+// acc folds a following ADD into the store epilogue: the caller then passes the ADD's
+// destination as dst and its other operand as acc, and no separate ADD pass runs. acc
+// must have dst's shape and layout, which ggml_cl_xmem_store_can_fuse_add checks.
 static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
         ggml_backend_t backend,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst,
-        bool swapped = false) {
+        bool swapped = false,
+        const ggml_tensor * acc = nullptr) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
     // When swapped, src1 is the weight-stationary operand and src0 is streamed; the
@@ -11540,6 +11587,12 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     const cl_ulong offset0 = extra0->offset + src0->view_offs;
     const cl_ulong offset1 = extra1->offset + src1->view_offs;
     const cl_ulong offsetd = extrad->offset + dst->view_offs;
+
+    // Unfused, the store still needs a valid buffer for the addend argument, so it gets
+    // dst's own and a zero flag rather than a null it would be undefined to dereference.
+    ggml_tensor_extra_cl * extra_acc = acc ? (ggml_tensor_extra_cl *)acc->extra : extrad;
+    const cl_ulong offset_acc = acc ? extra_acc->offset + acc->view_offs : offsetd;
+    const int      has_acc    = acc ? 1 : 0;
 
     const int K = src0->ne[0];
     const int M = src0->ne[1];
@@ -11629,6 +11682,9 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
         // offset and the slice origin rather than a pre-advanced pointer.
         const cl_ulong offsetd_n = swapped ? offsetd
                                            : offsetd + (cl_ulong) n0 * (cl_ulong) M * sizeof(float);
+        // acc shares dst's shape and layout, so it slices the same way.
+        const cl_ulong offset_acc_n = swapped ? offset_acc
+                                              : offset_acc + (cl_ulong) n0 * (cl_ulong) M * sizeof(float);
 
         cl_kernel pack_src = swapped ? backend_ctx->kernel_adreno_xmem_pack_src_f16
                                      : backend_ctx->kernel_adreno_xmem_pack_src_f32;
@@ -11663,15 +11719,19 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
 
         cl_kernel store_dst = swapped ? backend_ctx->kernel_adreno_xmem_store_dst_f32_t
                                       : backend_ctx->kernel_adreno_xmem_store_dst_f32;
-        CL_CHECK(clSetKernelArg(store_dst, 0, sizeof(cl_mem),   &dst_img));
-        CL_CHECK(clSetKernelArg(store_dst, 1, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(store_dst, 2, sizeof(cl_ulong), &offsetd_n));
-        CL_CHECK(clSetKernelArg(store_dst, 3, sizeof(int),      &M));
-        CL_CHECK(clSetKernelArg(store_dst, 4, sizeof(int),      &N));
+        cl_uint sarg = 0;
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(cl_mem),   &dst_img));
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(cl_ulong), &offsetd_n));
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(int),      &M));
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(int),      &N));
         if (swapped) {
-            CL_CHECK(clSetKernelArg(store_dst, 5, sizeof(int),  &N_full));
-            CL_CHECK(clSetKernelArg(store_dst, 6, sizeof(int),  &n0));
+            CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(int),  &N_full));
+            CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(int),  &n0));
         }
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(cl_mem),   &extra_acc->data_device));
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(cl_ulong), &offset_acc_n));
+        CL_CHECK(clSetKernelArg(store_dst, sarg++, sizeof(int),      &has_acc));
         // Consecutive x are consecutive dst columns in the transposed store, so a wide
         // x group keeps those writes contiguous.
         size_t store_lws[2] = { 16, 16 };
@@ -11684,6 +11744,28 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     }
 
     // src_img / dst_img / weights are persistent (backend_ctx) scratch — do NOT release per call.
+}
+
+static void ggml_cl_mulmat_trace(const ggml_tensor * src0, const ggml_tensor * src1,
+                                 const ggml_tensor * dst, const char * path);
+
+// Dispatches the xmem GEMM, absorbing the offered ADD into its store epilogue when the
+// pair qualifies, and reporting back so the caller knows whether the ADD still has to run.
+static void ggml_cl_mul_mat_xmem_maybe_fused(ggml_backend_t backend, const ggml_tensor * src0,
+                                             const ggml_tensor * src1, ggml_tensor * dst,
+                                             bool swapped, ggml_tensor * fuse_add, bool * fused) {
+    const ggml_tensor * acc = fuse_add ? ggml_cl_xmem_store_fused_addend(dst, fuse_add) : nullptr;
+    if (acc == nullptr) {
+        ggml_cl_mulmat_trace(src0, src1, dst, swapped ? "xmem_swapped" : "xmem");
+        ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, dst, swapped);
+        return;
+    }
+
+    ggml_cl_mulmat_trace(src0, src1, dst, swapped ? "xmem_swapped+add" : "xmem+add");
+    ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, fuse_add, swapped, acc);
+    if (fused) {
+        *fused = true;
+    }
 }
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
@@ -13365,13 +13447,21 @@ static void ggml_cl_mulmat_trace(const ggml_tensor * src0, const ggml_tensor * s
         (long)dst->ne[0], (long)dst->ne[1], (long)dst->ne[2], (long)dst->ne[3], path);
 }
 
-static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cl_mul_mat_impl(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1,
+                                 ggml_tensor * dst, ggml_tensor * fuse_add, bool * fused) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
     GGML_ASSERT(src1);
     GGML_ASSERT(src1->extra);
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
+
+    // Only the Adreno xmem store can absorb a following ADD; every other path below
+    // writes dst on its own and leaves this false.
+    if (fused) {
+        *fused = false;
+    }
+    UNUSED(fuse_add);
 
     const enum ggml_type src0t = src0 ? src0->type : GGML_TYPE_COUNT;
     const enum ggml_type src1t = src1 ? src1->type : GGML_TYPE_COUNT;
@@ -14037,7 +14127,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             case GGML_TYPE_F16: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
                 if (ggml_cl_can_use_adreno_xmem_gemm_f16_f32(backend_ctx, src0, src1, dst)) {
-                    ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, dst);
+                    ggml_cl_mul_mat_xmem_maybe_fused(backend, src0, src1, dst, false, fuse_add, fused);
                     return;
                 }
 #endif
@@ -14586,7 +14676,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // round; take it on the xmem path transposed instead of the GEMV.
                 if (ggml_cl_can_use_adreno_xmem_gemm_swapped(backend_ctx, src0, src1, dst)) {
                     ggml_cl_mulmat_trace(src0, src1, dst, "xmem_f16_f16_swapped");
-                    ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, dst, /*swapped=*/true);
+                    ggml_cl_mul_mat_xmem_maybe_fused(backend, src0, src1, dst, true, fuse_add, fused);
                     return;
                 }
 #endif
@@ -15256,6 +15346,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
         }
     }
+}
+
+// The op-dispatch table's signature: a matmul with nothing to fuse into it.
+static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cl_mul_mat_impl(backend, src0, src1, dst, nullptr, nullptr);
 }
 
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

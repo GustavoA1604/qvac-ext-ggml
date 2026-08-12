@@ -231,12 +231,20 @@ __kernel void kernel_gemm_xmem_f16_f32_os8(
     if (coord_s_out < npack) { write_imageh(dst_img, (int2)(X, coord_s_out), convert_half4(r7)); }
 }
 
+// acc_void folds a tap-sum ADD into this store: the caller passes the addend and
+// has_acc = 1, and dst becomes the ADD's destination. Bit-exact against running the ADD
+// separately, which also converts the half to f32 first and then adds in f32 -- the same
+// two operations in the same order. When has_acc is 0 the caller passes dst_void again,
+// so the argument is always a valid buffer and the branch is uniform across the group.
 __kernel void adreno_xmem_store_dst_f32(
     __read_only image2d_t dst_img,
     __global void * dst_void,
     ulong offset,
     int M,
-    int N) {
+    int N,
+    __global void * acc_void,
+    ulong acc_offset,
+    int has_acc) {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
     const int npack = (M + 3) / 4;
@@ -246,18 +254,21 @@ __kernel void adreno_xmem_store_dst_f32(
     }
 
     __global float * dst = (__global float *)((__global char *)dst_void + offset);
+    __global const float * acc = (__global const float *)((__global char *)acc_void + acc_offset);
     const half4 hv = read_imageh(dst_img, smp_zero, (int2)(x, y));
     const int m = y*4;
-    if (m + 0 < M) dst[x*M + m + 0] = (float)hv.s0;
-    if (m + 1 < M) dst[x*M + m + 1] = (float)hv.s1;
-    if (m + 2 < M) dst[x*M + m + 2] = (float)hv.s2;
-    if (m + 3 < M) dst[x*M + m + 3] = (float)hv.s3;
+    const int b = x*M + m;
+    if (m + 0 < M) dst[b + 0] = has_acc ? acc[b + 0] + (float)hv.s0 : (float)hv.s0;
+    if (m + 1 < M) dst[b + 1] = has_acc ? acc[b + 1] + (float)hv.s1 : (float)hv.s1;
+    if (m + 2 < M) dst[b + 2] = has_acc ? acc[b + 2] + (float)hv.s2 : (float)hv.s2;
+    if (m + 3 < M) dst[b + 3] = has_acc ? acc[b + 3] + (float)hv.s3 : (float)hv.s3;
 }
 
 // Transposed store, for the operand-swapped dispatch: the caller computed C[m][n] with
 // the SMALL operand as xmem's M, so ggml's dst wants it at dst[m*N_full + n] rather than
 // dst[n*M + m]. Consecutive x are consecutive n, so unlike the untransposed store above
 // (which strides by M) these writes coalesce.
+// acc_void folds the tap-sum ADD in, exactly as in the untransposed store above.
 __kernel void adreno_xmem_store_dst_f32_t(
     __read_only image2d_t dst_img,
     __global void * dst_void,
@@ -265,7 +276,10 @@ __kernel void adreno_xmem_store_dst_f32_t(
     int M,
     int N,
     int N_full,
-    int n0) {
+    int n0,
+    __global void * acc_void,
+    ulong acc_offset,
+    int has_acc) {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
     const int npack = (M + 3) / 4;
@@ -275,11 +289,16 @@ __kernel void adreno_xmem_store_dst_f32_t(
     }
 
     __global float * dst = (__global float *)((__global char *)dst_void + offset);
+    __global const float * acc = (__global const float *)((__global char *)acc_void + acc_offset);
     const half4 hv = read_imageh(dst_img, smp_zero, (int2)(x, y));
     const int  m   = y*4;
     const long col = (long)n0 + (long)x;
-    if (m + 0 < M) dst[(long)(m + 0)*N_full + col] = (float)hv.s0;
-    if (m + 1 < M) dst[(long)(m + 1)*N_full + col] = (float)hv.s1;
-    if (m + 2 < M) dst[(long)(m + 2)*N_full + col] = (float)hv.s2;
-    if (m + 3 < M) dst[(long)(m + 3)*N_full + col] = (float)hv.s3;
+    const long b0  = (long)(m + 0)*N_full + col;
+    const long b1  = (long)(m + 1)*N_full + col;
+    const long b2  = (long)(m + 2)*N_full + col;
+    const long b3  = (long)(m + 3)*N_full + col;
+    if (m + 0 < M) dst[b0] = has_acc ? acc[b0] + (float)hv.s0 : (float)hv.s0;
+    if (m + 1 < M) dst[b1] = has_acc ? acc[b1] + (float)hv.s1 : (float)hv.s1;
+    if (m + 2 < M) dst[b2] = has_acc ? acc[b2] + (float)hv.s2 : (float)hv.s2;
+    if (m + 3 < M) dst[b3] = has_acc ? acc[b3] + (float)hv.s3 : (float)hv.s3;
 }
