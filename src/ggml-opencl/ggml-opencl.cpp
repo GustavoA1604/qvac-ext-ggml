@@ -728,14 +728,16 @@ struct ggml_backend_opencl_context {
         }
 
         // Dump a csv
-        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size\n");
+        fprintf(fperf, "op name, kernel name, exec duration (ms), global size, local size, output size, queued (ns), submit (ns), start (ns), end (ns)\n");
         for (const ProfilingInfo & info : profiling_info) {
-            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu\n",
+            fprintf(fperf, "%s,%s,%f,%zux%zux%zu,%zux%zux%zu,%zux%zux%zux%zu,%llu,%llu,%llu,%llu\n",
                 info.op_name.c_str(), info.kernel_name.c_str(),
                 info.cmd_duration_ns/1.e6f,
                 info.global_size[0], info.global_size[1], info.global_size[2],
                 info.local_size[0], info.local_size[1], info.local_size[2],
-                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3]);
+                info.output_size[0], info.output_size[1], info.output_size[2], info.output_size[3],
+                (unsigned long long) info.cmd_queued, (unsigned long long) info.cmd_submit,
+                (unsigned long long) info.cmd_start,  (unsigned long long) info.cmd_end);
         }
         fclose(fperf);
 
