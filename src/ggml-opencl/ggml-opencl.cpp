@@ -518,6 +518,7 @@ struct ggml_backend_opencl_context {
     cl_program program_argsort_f32_i32;
     cl_program program_sum_rows_f32;
     cl_program program_pad;
+    cl_program program_argmax;
     cl_program program_upscale;
     cl_program program_conv_2d_f16;
     cl_program program_conv_2d_f32;
@@ -637,6 +638,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
     cl_kernel kernel_pad, kernel_pad_f32_4;
+    cl_kernel kernel_argmax_f32;
     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
     cl_kernel kernel_tanh_f16, kernel_tanh_f16_4, kernel_tanh_f16_nc;
     cl_kernel kernel_neg_f32, kernel_neg_f32_4, kernel_neg_f32_nc;
@@ -2647,6 +2649,27 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             backend_ctx->program_pad = nullptr;
             backend_ctx->kernel_pad = nullptr;
             backend_ctx->kernel_pad_f32_4 = nullptr;
+        }
+    }
+
+    // argmax
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "argmax.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("argmax.cl");
+#endif
+        if (!kernel_src.empty()) {
+            backend_ctx->program_argmax =
+                build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+            CL_CHECK((backend_ctx->kernel_argmax_f32 = clCreateKernel(backend_ctx->program_argmax, "kernel_argmax_f32", &err), err));
+            GGML_LOG_CONT(".");
+        } else {
+            GGML_LOG_WARN("ggml_opencl: argmax kernel source not found or empty. Argmax operations will not be available.\n");
+            backend_ctx->program_argmax = nullptr;
+            backend_ctx->kernel_argmax_f32 = nullptr;
         }
     }
 
@@ -4978,6 +5001,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return false;
             }
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_ARGMAX:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_UPSCALE: {
             ggml_scale_mode mode = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & 0xFF);
             const bool antialias = (ggml_scale_mode)(ggml_get_op_params_i32(op, 0) & GGML_SCALE_FLAG_ANTIALIAS);
@@ -10404,6 +10430,48 @@ static void ggml_cl_pad_f32_4(ggml_backend_t backend, const ggml_tensor * src0, 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// One workgroup per row of a [ne00, ne01] matrix, writing an I32 index per row.
+static void ggml_cl_argmax(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous_rows(src0));
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    if (backend_ctx->kernel_argmax_f32 == nullptr) {
+        GGML_LOG_WARN("%s: argmax kernel not available, skipping OpenCL execution.\n", __func__);
+        return;
+    }
+
+    ggml_tensor_extra_cl * extra_src0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra_dst  = (ggml_tensor_extra_cl *)dst->extra;
+
+    const cl_ulong off_src0 = extra_src0->offset + src0->view_offs;
+    const cl_ulong off_dst  = extra_dst->offset  + dst->view_offs;
+
+    const int      ne00 = (int)src0->ne[0];
+    const cl_ulong nb01 = src0->nb[1];
+
+    cl_kernel kernel = backend_ctx->kernel_argmax_f32;
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra_src0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &off_src0));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &off_dst));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &nb01));
+
+    // Must match ARGMAX_WG in argmax.cl: the reduction tree is sized by it.
+    const size_t lws = 256;
+    size_t global_work_size[] = { (size_t)src0->ne[1] * lws, 1, 1 };
+    size_t local_work_size[]  = { lws, 1, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -13792,8 +13860,15 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // T_latent=32 decode, plugin as the only variable). That measurement is the whole
     // basis for this exclusion -- the cause was never established, so treat it as an
     // empirical result to re-test rather than a rule about tile sizes.
+    //
+    // ne01 must also fill the M tile. A codec whose final convolution has one output
+    // channel reaches this gate as f16 x f32 with ne01 = 1, where every 64x64 tile
+    // computes 64 rows to keep one; the matrix-vector kernel below launches exactly
+    // ne01*ne11 outputs instead of CEIL_DIV(ne01,64)*64*ne11.
+    const int mul_mm_min_m = 64;  // BM, the GEMM's M tile height
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
+        ne01 >= mul_mm_min_m &&
         ne11 > 1) {
         switch(src0t) {
             case GGML_TYPE_F32: {
@@ -16857,6 +16932,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             ggml_cl_pad(backend, tensor->src[0], tensor);
+            return true;
+        case GGML_OP_ARGMAX:
+            if (!any_on_device) {
+                return false;
+            }
+            ggml_cl_argmax(backend, tensor->src[0], tensor);
             return true;
         case GGML_OP_UPSCALE:
             if (!any_on_device) {
