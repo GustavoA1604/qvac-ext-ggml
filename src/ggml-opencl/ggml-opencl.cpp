@@ -71,6 +71,20 @@
 #define GGML_OPENCL_GEMV_WIDE_SIMDGROUPS 16
 #define GGML_OPENCL_GEMV_WIDE_MAX_M 2048
 
+// Work-group sizes these two kernels are written for. Both launches clamp to the
+// kernel's own CL_KERNEL_WORK_GROUP_SIZE, which register pressure can push below the
+// device limit, so the kernels must not assume they get the full size.
+// ARGMAX_WG must stay in step with the same name in argmax.cl, which sizes its scratch
+// by it.
+#define GGML_OPENCL_ARGMAX_WG 256
+#define GGML_OPENCL_PAD_F32_4_WG 256
+
+// Smallest ne01 still routed onto the tiled local-memory GEMM, on Adreno. Below it the
+// tile is mostly padding, and the matrix-vector kernel launches exactly ne01*ne11 outputs
+// instead of CEIL_DIV(ne01,64)*64*ne11. GGML_OPENCL_MUL_MM_MIN_M overrides it, which is
+// how the value was measured; 0 disables the gate.
+#define GGML_OPENCL_MUL_MM_MIN_M 64
+
 #define CL_CHECK(err)                                               \
     do {                                                            \
         cl_int err_ = (err);                                        \
@@ -439,6 +453,7 @@ struct ggml_backend_opencl_context {
     bool disable_fusion;
     int  gemv_wide_simdgroups;
     int  gemv_wide_max_m;
+    int  mul_mm_min_m;
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -813,7 +828,6 @@ struct ggml_backend_opencl_context {
     cl_program program_CL_gemm_f32;
     cl_program program_im2col_bt;
     cl_program program_CL_gemv_general;
-    cl_program program_CL_gemv_general_wide;
     cl_program program_CL_gemv_4096_1_11008;
     cl_program program_CL_gemv_4096_1_4096;
     cl_program program_CL_gemv_11008_1_4096;
@@ -3183,9 +3197,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         if (backend_ctx->gemv_wide_simdgroups > 0) {
             const std::string CL_gemv_wide_opts = CL_gemv_compile_opts + " -DN_SIMDGROUP=" +
                                                   std::to_string(backend_ctx->gemv_wide_simdgroups);
-            backend_ctx->program_CL_gemv_general_wide = build_program_from_source(
+            cl_program prog_wide = build_program_from_source(
                 backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
-            CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide = clCreateKernel(backend_ctx->program_CL_gemv_general_wide, "kernel_gemv_noshuffle", &err), err));
+            CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide = clCreateKernel(prog_wide, "kernel_gemv_noshuffle", &err), err));
+            CL_CHECK(clReleaseProgram(prog_wide));
         }
         GGML_LOG_CONT(".");
     }
@@ -4143,6 +4158,15 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     }
     GGML_LOG_INFO("ggml_opencl: narrow-matrix gemv: %d waves for M <= %d\n",
                   backend_ctx->gemv_wide_simdgroups, backend_ctx->gemv_wide_max_m);
+
+    // Measured on Adreno only, so only Adreno gets the gate; every other device keeps
+    // routing exactly as it did. On an Adreno 740 the Audio8 codec spends 9.3 s in
+    // synthesis with the gate off against 4.1 s at 64, and 8 through 96 are flat.
+    backend_ctx->mul_mm_min_m =
+        backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? GGML_OPENCL_MUL_MM_MIN_M : 0;
+    if (const char * min_m = getenv("GGML_OPENCL_MUL_MM_MIN_M")) {
+        backend_ctx->mul_mm_min_m = atoi(min_m);
+    }
 
     // Load kernels
     load_cl_kernels(backend_ctx.get(), opencl_c_version);
@@ -10483,8 +10507,9 @@ static void ggml_cl_pad_f32_4(ggml_backend_t backend, const ggml_tensor * src0, 
     CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &rp3));
     CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &total_v));
 
-    const size_t lws = 256;
-    size_t global_work_size[] = { (((size_t)total_v + lws - 1) / lws) * lws, 1, 1 };
+    size_t lws = MIN((size_t) GGML_OPENCL_PAD_F32_4_WG,
+                     backend_ctx->get_kernel_workgroup_size(kernel));
+    size_t global_work_size[] = { CEIL_DIV((size_t)total_v, lws) * lws, 1, 1 };
     size_t local_work_size[]  = { lws, 1, 1 };
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
@@ -10524,8 +10549,10 @@ static void ggml_cl_argmax(ggml_backend_t backend, const ggml_tensor * src0, ggm
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne00));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &nb01));
 
-    // Must match ARGMAX_WG in argmax.cl: the reduction tree is sized by it.
-    const size_t lws = 256;
+    // ARGMAX_WG in argmax.cl sizes the scratch, so it is the ceiling; the kernel reduces
+    // over get_local_size, so a lower per-kernel limit stays correct.
+    const size_t lws = MIN((size_t) GGML_OPENCL_ARGMAX_WG,
+                           backend_ctx->get_kernel_workgroup_size(kernel));
     size_t global_work_size[] = { (size_t)src0->ne[1] * lws, 1, 1 };
     size_t local_work_size[]  = { lws, 1, 1 };
 
@@ -13934,7 +13961,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // channel reaches this gate as f16 x f32 with ne01 = 1, where every 64x64 tile
     // computes 64 rows to keep one; the matrix-vector kernel below launches exactly
     // ne01*ne11 outputs instead of CEIL_DIV(ne01,64)*64*ne11.
-    const int mul_mm_min_m = 64;  // BM, the GEMM's M tile height
+    const int mul_mm_min_m = backend_ctx->mul_mm_min_m;
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
         ne01 >= mul_mm_min_m &&
