@@ -9218,6 +9218,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Time-axis-only padding of a contiguous tensor: the shape a convolutional codec pads
+    // its history with, and the one a dim0-untouched fast path special-cases. Every case
+    // above pads dim0, so none of them reach it.
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {96, 1024, 1, 1}, 0, 0, 6, 0, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {192, 512, 1, 1}, 0, 0, 54, 3, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 3, 2}, 0, 0, 1, 2, 1, 1, 1, 0));
+    // Neighbours that must keep taking the general path: dim0 padded, and ne0 % 4 != 0.
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 1, 1}, 1, 0, 1, 1, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {6, 32, 1, 1}, 0, 0, 1, 1, 0, 0, 0, 0));
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;

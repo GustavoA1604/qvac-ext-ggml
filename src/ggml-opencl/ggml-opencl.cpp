@@ -636,7 +636,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
-    cl_kernel kernel_pad;
+    cl_kernel kernel_pad, kernel_pad_f32_4;
     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
     cl_kernel kernel_tanh_f16, kernel_tanh_f16_4, kernel_tanh_f16_nc;
     cl_kernel kernel_neg_f32, kernel_neg_f32_4, kernel_neg_f32_nc;
@@ -2640,11 +2640,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             backend_ctx->program_pad =
                 build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
             CL_CHECK((backend_ctx->kernel_pad = clCreateKernel(backend_ctx->program_pad, "kernel_pad", &err), err));
+            CL_CHECK((backend_ctx->kernel_pad_f32_4 = clCreateKernel(backend_ctx->program_pad, "kernel_pad_f32_4", &err), err));
             GGML_LOG_CONT(".");
         } else {
             GGML_LOG_WARN("ggml_opencl: pad kernel source not found or empty. Pad operations will not be available.\n");
             backend_ctx->program_pad = nullptr;
             backend_ctx->kernel_pad = nullptr;
+            backend_ctx->kernel_pad_f32_4 = nullptr;
         }
     }
 
@@ -8250,9 +8252,8 @@ static void ggml_cl_mul(ggml_backend_t backend, const ggml_tensor * src0, const 
     bool bcast_row = false;
     cl_kernel kernel;
 
-    if (ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ne00 % 4 == 0 && ne10 % 4 == 0) {
-        GGML_ASSERT(ggml_is_contiguous(src0));
-
+    if (ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ggml_is_contiguous(src0) &&
+        ne00 % 4 == 0 && ne10 % 4 == 0) {
         // src1 is a row
         GGML_ASSERT(ne11 == 1);
 
@@ -8383,9 +8384,8 @@ static void ggml_cl_div(ggml_backend_t backend, const ggml_tensor * src0, const 
     bool bcast_row = false;
     cl_kernel kernel;
 
-    if (ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ne00 % 4 == 0 && ne10 % 4 == 0) {
-        GGML_ASSERT(ggml_is_contiguous(src0));
-
+    if (ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ggml_is_contiguous(src0) &&
+        ne00 % 4 == 0 && ne10 % 4 == 0) {
         // src1 is a row
         GGML_ASSERT(ne11 == 1);
 
@@ -8504,9 +8504,8 @@ static void ggml_cl_sub(ggml_backend_t backend, const ggml_tensor * src0, const 
     bool bcast_row = false;
     cl_kernel kernel;
 
-    if (ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ne00 % 4 == 0 && ne10 % 4 == 0) {
-        GGML_ASSERT(ggml_is_contiguous(src0));
-
+    if (ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ggml_is_contiguous(src0) &&
+        ne00 % 4 == 0 && ne10 % 4 == 0) {
         // src1 is a row
         GGML_ASSERT(ne11 == 1);
 
@@ -10340,6 +10339,71 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// Nothing padded on dim0 and both tensors contiguous, so every output row is either a
+// whole source row or all zeros and the copy can go four floats at a time.
+static bool ggml_cl_pad_can_use_f32_4(const ggml_tensor * src0, const ggml_tensor * dst) {
+    const int lp0 = ((const int *)(dst->op_params))[0];
+    const int rp0 = ((const int *)(dst->op_params))[1];
+    return lp0 == 0 && rp0 == 0 &&
+           src0->ne[0] % 4 == 0 &&
+           ggml_is_contiguous(src0) && ggml_is_contiguous(dst);
+}
+
+// One flat 256-wide launch over float4 elements. The generic kernel runs one float per
+// work-item with a 64-wide workgroup per output row, which on Adreno is a workgroup per
+// 256 bytes and is dispatch-bound rather than bandwidth-bound.
+static void ggml_cl_pad_f32_4(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * extra_src0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * extra_dst  = (ggml_tensor_extra_cl *)dst->extra;
+
+    const cl_ulong off_src0 = extra_src0->offset + src0->view_offs;
+    const cl_ulong off_dst  = extra_dst->offset  + dst->view_offs;
+
+    const int ne0v  = (int)(dst->ne[0] / 4);
+    const int s_ne01 = (int)src0->ne[1];
+    const int s_ne02 = (int)src0->ne[2];
+    const int d_ne1 = (int)dst->ne[1];
+    const int d_ne2 = (int)dst->ne[2];
+    const int d_ne3 = (int)dst->ne[3];
+
+    const int lp1 = ((const int *)(dst->op_params))[2];
+    const int rp1 = ((const int *)(dst->op_params))[3];
+    const int lp2 = ((const int *)(dst->op_params))[4];
+    const int rp2 = ((const int *)(dst->op_params))[5];
+    const int lp3 = ((const int *)(dst->op_params))[6];
+    const int rp3 = ((const int *)(dst->op_params))[7];
+
+    const int total_v = ne0v * d_ne1 * d_ne2 * d_ne3;
+
+    cl_kernel kernel = backend_ctx->kernel_pad_f32_4;
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_src0->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_src0));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_dst));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &ne0v));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &s_ne01));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &s_ne02));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &d_ne1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &d_ne2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &d_ne3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &lp1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &rp1));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &lp2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &rp2));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &lp3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &rp3));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &total_v));
+
+    const size_t lws = 256;
+    size_t global_work_size[] = { (((size_t)total_v + lws - 1) / lws) * lws, 1, 1 };
+    size_t local_work_size[]  = { lws, 1, 1 };
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -10355,6 +10419,11 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
         return;
     }
 
+    if (backend_ctx->kernel_pad_f32_4 != nullptr && ggml_cl_pad_can_use_f32_4(src0, dst)) {
+        ggml_cl_pad_f32_4(backend, src0, dst);
+        return;
+    }
+
     ggml_tensor_extra_cl * extra_src0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra_dst  = (ggml_tensor_extra_cl *)dst->extra;
 
@@ -10366,20 +10435,22 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
     const int s_ne2 = src0->ne[2];
     const int s_ne3 = src0->ne[3];
 
-    const int s_nb0 = src0->nb[0];
-    const int s_nb1 = src0->nb[1];
-    const int s_nb2 = src0->nb[2];
-    const int s_nb3 = src0->nb[3];
+    // cl_ulong to match the kernel's `ulong nb*` parameters: these are passed with
+    // sizeof(cl_ulong), so an int here is an eight-byte read of a four-byte object.
+    const cl_ulong s_nb0 = src0->nb[0];
+    const cl_ulong s_nb1 = src0->nb[1];
+    const cl_ulong s_nb2 = src0->nb[2];
+    const cl_ulong s_nb3 = src0->nb[3];
 
     const int d_ne0 = dst->ne[0];
     const int d_ne1 = dst->ne[1];
     const int d_ne2 = dst->ne[2];
     const int d_ne3 = dst->ne[3];
 
-    const int d_nb0 = dst->nb[0];
-    const int d_nb1 = dst->nb[1];
-    const int d_nb2 = dst->nb[2];
-    const int d_nb3 = dst->nb[3];
+    const cl_ulong d_nb0 = dst->nb[0];
+    const cl_ulong d_nb1 = dst->nb[1];
+    const cl_ulong d_nb2 = dst->nb[2];
+    const cl_ulong d_nb3 = dst->nb[3];
 
     const int lp0 = ((const int*)(dst->op_params))[0];
     const int rp0 = ((const int*)(dst->op_params))[1];
@@ -10426,6 +10497,7 @@ static void ggml_cl_pad(ggml_backend_t backend, const ggml_tensor * src0, ggml_t
 
     size_t global_work_size[] = { gws0, (size_t)d_ne1, (size_t)d_ne2*d_ne3 };
     size_t local_work_size[]  = { lws0, 1, 1 };
+
 
     size_t * local_work_size_ptr = local_work_size;
      if (d_ne0 % lws0 != 0 && !backend_ctx->non_uniform_workgroups) {
