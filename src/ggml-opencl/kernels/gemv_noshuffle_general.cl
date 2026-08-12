@@ -9,7 +9,12 @@
 
 // assume
 #define QK4_0 32
+// Waves per workgroup, each covering a slice of K. The launch must pass it as the
+// dim-1 work-group size. Raising it is the only source of extra parallelism when M is
+// small, since dim 0 carries a fixed number of fibers.
+#ifndef N_SIMDGROUP
 #define N_SIMDGROUP 4
+#endif
 
 #define dequantizeBlockAccum_ns_sgbroadcast_1_hi(total_sums, bits4, scale, y) \
     float shared_y; \
@@ -216,7 +221,9 @@ __kernel void kernel_gemv_noshuffle(
     uint M = ne01;
 
     uint LINE_STRIDE_A = M / 2;
-    uint BLOCK_STRIDE_A = N_SIMDGROUP * M;
+    // One K-block spans the 8 half-lines read below, so this is a property of the
+    // weight layout rather than of how many waves share the workgroup.
+    uint BLOCK_STRIDE_A = 8 * LINE_STRIDE_A;
 
     __private uint4     regA;
     __private half2     regS;
@@ -255,15 +262,16 @@ __kernel void kernel_gemv_noshuffle(
 #endif // VECTOR_SUB_GROUP_BROADCAT
     }
 
-    // reduction in local memory, assumes #wave=4
-    __local float2 reduceLM[SIMDGROUP_WIDTH * 3];
-    if (groupId == 1) reduceLM[SIMDGROUP_WIDTH * 0 + slid] = totalSum;
-    if (groupId == 2) reduceLM[SIMDGROUP_WIDTH * 1 + slid] = totalSum;
-    if (groupId == 3) reduceLM[SIMDGROUP_WIDTH * 2 + slid] = totalSum;
+    // reduction in local memory, one slot per wave above wave 0. At N_SIMDGROUP == 4
+    // this accumulates in the same order as the unrolled form it replaces.
+    __local float2 reduceLM[SIMDGROUP_WIDTH * (N_SIMDGROUP - 1)];
+    if (groupId > 0) reduceLM[SIMDGROUP_WIDTH * (groupId - 1) + slid] = totalSum;
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 0 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 1 + slid];
-    if (groupId == 0) totalSum += reduceLM[SIMDGROUP_WIDTH * 2 + slid];
+    if (groupId == 0) {
+        for (uint w = 0; w < N_SIMDGROUP - 1; ++w) {
+            totalSum += reduceLM[SIMDGROUP_WIDTH * w + slid];
+        }
+    }
 
     // 2 outputs per fiber in wave 0. Dim 0 is rounded up to a whole wave, so the last
     // wave runs past M whenever M/2 is not a multiple of the wave size.

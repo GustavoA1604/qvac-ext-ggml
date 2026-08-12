@@ -64,6 +64,13 @@
 
 #define UNUSED(x) (void)(x)
 
+// Waves per workgroup for the narrow-matrix gemv variant, and the widest output row
+// count that still counts as narrow. Measured on Adreno 740: at M=896 the stock 4-wave
+// launch fills 7 workgroups and reaches 5.4 GB/s, while 16 waves reach 1.54x that.
+// M=4864 is faster on the stock count, hence the cutoff rather than a blanket change.
+#define GGML_OPENCL_GEMV_WIDE_SIMDGROUPS 16
+#define GGML_OPENCL_GEMV_WIDE_MAX_M 2048
+
 #define CL_CHECK(err)                                               \
     do {                                                            \
         cl_int err_ = (err);                                        \
@@ -430,6 +437,8 @@ struct ggml_backend_opencl_context {
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
     bool disable_fusion;
+    int  gemv_wide_simdgroups;
+    int  gemv_wide_max_m;
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -804,12 +813,14 @@ struct ggml_backend_opencl_context {
     cl_program program_CL_gemm_f32;
     cl_program program_im2col_bt;
     cl_program program_CL_gemv_general;
+    cl_program program_CL_gemv_general_wide;
     cl_program program_CL_gemv_4096_1_11008;
     cl_program program_CL_gemv_4096_1_4096;
     cl_program program_CL_gemv_11008_1_4096;
     cl_program program_CL_gemv_32000_1_4096;
     cl_kernel CL_mul_mat_Ab_Bi_8x4;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general;
+    cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_11008;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_4096_1_4096;
     cl_kernel CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096;
@@ -821,6 +832,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f32_f32_8x4;
     cl_kernel kernel_im2col_bt_f32;
     cl_kernel CL_mul_mat_vec_q8_0_f32;
+    cl_kernel CL_mul_mat_vec_q8_0_f32_wide;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
     cl_kernel kernel_gemv_noshuffle_q6_K_f32;
@@ -3167,6 +3179,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_compile_opts);
 
         CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general = clCreateKernel(backend_ctx->program_CL_gemv_general, "kernel_gemv_noshuffle", &err), err));
+
+        if (backend_ctx->gemv_wide_simdgroups > 0) {
+            const std::string CL_gemv_wide_opts = CL_gemv_compile_opts + " -DN_SIMDGROUP=" +
+                                                  std::to_string(backend_ctx->gemv_wide_simdgroups);
+            backend_ctx->program_CL_gemv_general_wide = build_program_from_source(
+                backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
+            CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide = clCreateKernel(backend_ctx->program_CL_gemv_general_wide, "kernel_gemv_noshuffle", &err), err));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -3404,6 +3424,15 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
         CL_CHECK((backend_ctx->CL_mul_mat_vec_q8_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+
+        if (backend_ctx->gemv_wide_simdgroups > 0) {
+            const std::string CL_gemv_wide_opts = CL_gemv_compile_opts + " -DN_SIMDGROUP=" +
+                                                  std::to_string(backend_ctx->gemv_wide_simdgroups);
+            cl_program prog_wide = build_program_from_source(
+                backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
+            CL_CHECK((backend_ctx->CL_mul_mat_vec_q8_0_f32_wide = clCreateKernel(prog_wide, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
+            CL_CHECK(clReleaseProgram(prog_wide));
+        }
         GGML_LOG_CONT(".");
     }
 
@@ -4096,6 +4125,25 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 #endif
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
 
+    backend_ctx->gemv_wide_simdgroups = GGML_OPENCL_GEMV_WIDE_SIMDGROUPS;
+    if (const char * waves = getenv("GGML_OPENCL_GEMV_WIDE_SIMDGROUPS")) {
+        backend_ctx->gemv_wide_simdgroups = atoi(waves);
+    }
+    backend_ctx->gemv_wide_max_m = GGML_OPENCL_GEMV_WIDE_MAX_M;
+    if (const char * max_m = getenv("GGML_OPENCL_GEMV_WIDE_MAX_M")) {
+        backend_ctx->gemv_wide_max_m = atoi(max_m);
+    }
+    // One workgroup is wave_size x simdgroups fibers, so the variant is only available
+    // while that fits the device limit.
+    if (backend_ctx->gemv_wide_simdgroups < 2 ||
+        (size_t) backend_ctx->gemv_wide_simdgroups * backend_ctx->adreno_wave_size >
+            backend_ctx->max_workgroup_size) {
+        backend_ctx->gemv_wide_simdgroups = 0;
+        backend_ctx->gemv_wide_max_m      = 0;
+    }
+    GGML_LOG_INFO("ggml_opencl: narrow-matrix gemv: %d waves for M <= %d\n",
+                  backend_ctx->gemv_wide_simdgroups, backend_ctx->gemv_wide_max_m);
+
     // Load kernels
     load_cl_kernels(backend_ctx.get(), opencl_c_version);
 
@@ -4767,6 +4815,16 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor);
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
+
+// The gemv launches put a fixed number of fibers on dim 0 (M, or M/2 for q4_0), so a
+// narrow matrix cannot fill the device however much weight traffic it has to move.
+// Splitting K across more waves is the one remaining source of parallelism, and each
+// wave still needs a share of K to be worth launching.
+static bool gemv_prefers_wide(const ggml_backend_opencl_context * backend_ctx, int M, int k_blocks) {
+    return backend_ctx->gemv_wide_simdgroups > 0 &&
+           M <= backend_ctx->gemv_wide_max_m &&
+           k_blocks >= backend_ctx->gemv_wide_simdgroups;
+}
 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -12557,6 +12615,11 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
         kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32;
+        int gemv_simdgroups = 4;
+        if (gemv_prefers_wide(backend_ctx, M, K / ggml_blck_size(GGML_TYPE_Q8_0))) {
+            kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32_wide;
+            gemv_simdgroups = backend_ctx->gemv_wide_simdgroups;
+        }
 
         int r2 = 1;
         int r3 = 1;
@@ -12578,8 +12641,8 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 
         size_t wavesize = backend_ctx->adreno_wave_size;
-        size_t local_work_size[]  = { wavesize, 4, 1 };
-        size_t global_work_size[] = { CEIL_DIV(M, wavesize)*wavesize, 4, 1 };
+        size_t local_work_size[]  = { wavesize, (size_t) gemv_simdgroups, 1 };
+        size_t global_work_size[] = { CEIL_DIV(M, wavesize)*wavesize, (size_t) gemv_simdgroups, 1 };
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
@@ -13651,6 +13714,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
         // choose gemm or gemv kernel
         // <--------------------------------------------> //
+        int gemv_simdgroups = 4;
         if (N == 1) {
             kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general;
             if (M == 4096 && K == 4096) {
@@ -13661,6 +13725,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096;
             } else if (M == 32000 && K == 4096) {
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096;
+            } else if (gemv_prefers_wide(backend_ctx, M, K / ggml_blck_size(GGML_TYPE_Q4_0))) {
+                kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide;
+                gemv_simdgroups = backend_ctx->gemv_wide_simdgroups;
             }
         } else {
             kernel = backend_ctx->CL_mul_mat_Ab_Bi_8x4;
@@ -13738,11 +13805,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         if (N == 1) {
             size_t wavesize = backend_ctx->adreno_wave_size;
             local_work_size[0] = wavesize; // localsize
-            local_work_size[1] = 4; // reduce factor
+            local_work_size[1] = gemv_simdgroups; // reduce factor
             local_work_size[2] = 1;
 
             global_work_size[0] = (((M / 2) + wavesize - 1) / wavesize) * wavesize;
-            global_work_size[1] = 4; // reduce factor
+            global_work_size[1] = gemv_simdgroups; // reduce factor
             global_work_size[2] = 1;
         }
         // <--------------------------------------------> //
