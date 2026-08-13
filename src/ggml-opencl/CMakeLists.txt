@@ -173,6 +173,7 @@ set(GGML_OPENCL_KERNELS
     leaky_relu
     sin
     pad
+    argmax
     repeat
     mul_mat_f16_f32
     mul_mm_f16_f32_kq_kqv

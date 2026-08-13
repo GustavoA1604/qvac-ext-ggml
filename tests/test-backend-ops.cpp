@@ -8693,6 +8693,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
 
+    // The Adreno gemv splits K across waves, and is only selected once both dimensions
+    // reach 384, so every n=1 case above (m=16, k=256) misses it entirely. These reach
+    // it: 896x896 is the shape a small LM's attention projections take, narrow enough
+    // that the launch cannot fill the GPU, and 2052 sits just past the narrow cutoff so
+    // the stock wave count is covered by the same sweep.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 896, 1, 896, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2052, 1, 896, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    }
+
     // Multi-channel src0 whose channels are strided over more rows than the view exposes.
     // F16 is the KV-cache case; the quantized ones additionally check that the channel
     // stride is converted to elements using the block size rather than the type size.
@@ -9217,6 +9227,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
         }
     }
+
+    // Time-axis-only padding of a contiguous tensor: the shape a convolutional codec pads
+    // its history with, and the one a dim0-untouched fast path special-cases. Every case
+    // above pads dim0, so none of them reach it.
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {96, 1024, 1, 1}, 0, 0, 6, 0, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {192, 512, 1, 1}, 0, 0, 54, 3, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 3, 2}, 0, 0, 1, 2, 1, 1, 1, 0));
+    // Neighbours that must keep taking the general path: dim0 padded, and ne0 % 4 != 0.
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 1, 1}, 1, 0, 1, 1, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {6, 32, 1, 1}, 0, 0, 1, 1, 0, 0, 0, 0));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
