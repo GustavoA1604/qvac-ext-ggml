@@ -8886,6 +8886,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {8, 1, 1, 1}, 0));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {16, 1, 1, 1}, 0));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {16, 2, 1, 1}, 1));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {32, 1, 2, 1}, 4));
+    test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {64, 8, 1, 1}, 5));
 
 #if 0
     std::uniform_int_distribution<> dist_ne1(1, 50);

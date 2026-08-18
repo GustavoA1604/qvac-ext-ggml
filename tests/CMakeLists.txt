@@ -180,6 +180,11 @@ target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+if (GGML_OPENCL)
+    set(TEST_TARGET test-opencl-workgroup)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     #

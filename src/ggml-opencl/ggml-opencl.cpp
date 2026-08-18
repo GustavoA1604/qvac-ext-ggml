@@ -8,12 +8,17 @@
 #endif
 
 #include "ggml-opencl.h"
+#include "ggml-opencl-workgroup.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
 #include <CL/cl.h>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include <inttypes.h>
 #include <string.h>
@@ -29,6 +34,58 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+
+static constexpr size_t OPENCL_KERNEL_NAME_CAPACITY = 256;
+static constexpr size_t OPENCL_ENQUEUE_ERROR_CAPACITY = 512;
+static constexpr char OPENCL_ENQUEUE_ERROR_FORMAT[] =
+    "clEnqueueNDRangeKernel error %d kernel=%s op=%s gws=[%zu,%zu,%zu] lws=%s[%zu,%zu,%zu]";
+#ifdef __ANDROID__
+static constexpr char OPENCL_LOG_TAG[] = "ggml-opencl";
+#endif
+
+static size_t checked_size_product(size_t lhs, size_t rhs) {
+    GGML_ASSERT(lhs == 0 || rhs <= SIZE_MAX / lhs);
+    return lhs * rhs;
+}
+
+static void log_opencl_enqueue_failure(
+        cl_int err,
+        cl_kernel kernel,
+        cl_uint work_dim,
+        const size_t * global_work_size,
+        const size_t * local_work_size,
+        const ggml_tensor * tensor) {
+    char kernel_name[OPENCL_KERNEL_NAME_CAPACITY] = "unknown";
+    clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, NULL);
+
+    const size_t g0 = global_work_size ? global_work_size[0] : 0;
+    const size_t g1 = work_dim > 1 && global_work_size ? global_work_size[1] : 1;
+    const size_t g2 = work_dim > 2 && global_work_size ? global_work_size[2] : 1;
+    const size_t l0 = local_work_size ? local_work_size[0] : 0;
+    const size_t l1 = work_dim > 1 && local_work_size ? local_work_size[1] : 0;
+    const size_t l2 = work_dim > 2 && local_work_size ? local_work_size[2] : 0;
+
+    char message[OPENCL_ENQUEUE_ERROR_CAPACITY];
+    std::snprintf(
+        message,
+        sizeof(message),
+        OPENCL_ENQUEUE_ERROR_FORMAT,
+        err,
+        kernel_name,
+        tensor ? ggml_op_name(tensor->op) : "null",
+        g0,
+        g1,
+        g2,
+        local_work_size ? "set" : "null",
+        l0,
+        l1,
+        l2);
+
+#ifdef __ANDROID__
+    __android_log_write(ANDROID_LOG_ERROR, OPENCL_LOG_TAG, message);
+#endif
+    GGML_LOG_ERROR("ggml_opencl: %s\n", message);
+}
 
 // qvac-parakeet patch: persistent kernel binary cache support. The
 // helpers below sit on POSIX file primitives (mkdir/unlink/fsync) but
@@ -78,6 +135,7 @@
 // by it.
 #define GGML_OPENCL_ARGMAX_WG 256
 #define GGML_OPENCL_PAD_F32_4_WG 256
+#define GGML_OPENCL_DIAG_MASK_INF_8_WG 64
 
 // Smallest ne01 still routed onto the tiled local-memory GEMM, on Adreno. Below it the
 // tile is mostly padding, and the matrix-vector kernel launches exactly ne01*ne11 outputs
@@ -453,6 +511,8 @@ struct ggml_backend_opencl_context {
     bool disable_fusion;
     int  gemv_wide_simdgroups;
     int  gemv_wide_max_m;
+    size_t gemv_wide_q4_max_workgroup_size = 0;
+    size_t gemv_wide_q8_max_workgroup_size = 0;
     int  mul_mm_min_m;
 
     bool adreno_has_large_buffer;
@@ -800,13 +860,19 @@ struct ggml_backend_opencl_context {
     void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
 #ifdef GGML_OPENCL_PROFILING
         cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-
+        cl_event * event = &evt;
+#else
+        cl_event * event = NULL;
+#endif
+        const cl_int err = clEnqueueNDRangeKernel(
+            queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, event);
+        if (err != CL_SUCCESS) {
+            log_opencl_enqueue_failure(err, kernel, work_dim, global_work_size, local_work_size, tensor);
+            GGML_ASSERT(0);
+        }
+#ifdef GGML_OPENCL_PROFILING
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
-#else
-        GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
 
@@ -3200,6 +3266,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             cl_program prog_wide = build_program_from_source(
                 backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
             CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide = clCreateKernel(prog_wide, "kernel_gemv_noshuffle", &err), err));
+            backend_ctx->gemv_wide_q4_max_workgroup_size =
+                backend_ctx->get_kernel_workgroup_size(backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide);
             CL_CHECK(clReleaseProgram(prog_wide));
         }
         GGML_LOG_CONT(".");
@@ -3446,6 +3514,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             cl_program prog_wide = build_program_from_source(
                 backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
             CL_CHECK((backend_ctx->CL_mul_mat_vec_q8_0_f32_wide = clCreateKernel(prog_wide, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
+            backend_ctx->gemv_wide_q8_max_workgroup_size =
+                backend_ctx->get_kernel_workgroup_size(backend_ctx->CL_mul_mat_vec_q8_0_f32_wide);
             CL_CHECK(clReleaseProgram(prog_wide));
         }
         GGML_LOG_CONT(".");
@@ -4844,10 +4914,18 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 // narrow matrix cannot fill the device however much weight traffic it has to move.
 // Splitting K across more waves is the one remaining source of parallelism, and each
 // wave still needs a share of K to be worth launching.
-static bool gemv_prefers_wide(const ggml_backend_opencl_context * backend_ctx, int M, int k_blocks) {
-    return backend_ctx->gemv_wide_simdgroups > 0 &&
-           M <= backend_ctx->gemv_wide_max_m &&
-           k_blocks >= backend_ctx->gemv_wide_simdgroups;
+static bool gemv_prefers_wide(
+        const ggml_backend_opencl_context * backend_ctx,
+        size_t kernel_max_workgroup_size,
+        int M,
+        int k_blocks) {
+    return ggml_opencl_should_use_wide_gemv(
+        (size_t) backend_ctx->adreno_wave_size,
+        backend_ctx->gemv_wide_simdgroups,
+        kernel_max_workgroup_size,
+        M,
+        backend_ctx->gemv_wide_max_m,
+        k_blocks);
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -12725,7 +12803,11 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
 
         kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32;
         int gemv_simdgroups = 4;
-        if (gemv_prefers_wide(backend_ctx, M, K / ggml_blck_size(GGML_TYPE_Q8_0))) {
+        if (gemv_prefers_wide(
+                backend_ctx,
+                backend_ctx->gemv_wide_q8_max_workgroup_size,
+                M,
+                K / ggml_blck_size(GGML_TYPE_Q8_0))) {
             kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32_wide;
             gemv_simdgroups = backend_ctx->gemv_wide_simdgroups;
         }
@@ -13842,7 +13924,11 @@ static void ggml_cl_mul_mat_impl(ggml_backend_t backend, const ggml_tensor * src
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096;
             } else if (M == 32000 && K == 4096) {
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096;
-            } else if (gemv_prefers_wide(backend_ctx, M, K / ggml_blck_size(GGML_TYPE_Q4_0))) {
+            } else if (gemv_prefers_wide(
+                    backend_ctx,
+                    backend_ctx->gemv_wide_q4_max_workgroup_size,
+                    M,
+                    K / ggml_blck_size(GGML_TYPE_Q4_0))) {
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide;
                 gemv_simdgroups = backend_ctx->gemv_wide_simdgroups;
             }
@@ -16009,6 +16095,11 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
 
     if (ne00%8 == 0) {
         kernel = backend_ctx->kernel_diag_mask_inf_8;
+        const size_t elements = checked_size_product(
+            checked_size_product((size_t) ne00, (size_t) ne01),
+            (size_t) ne02);
+        const size_t n = elements / 8;
+        const cl_ulong kernel_n = (cl_ulong) n;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
@@ -16017,9 +16108,12 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne00));
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &ne01));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &n_past));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &kernel_n));
 
-        size_t global_work_size[] = {(size_t)ne00*ne01*ne02/8, 1, 1};
-        size_t local_work_size[] = {64, 1, 1};
+        const size_t lws = MIN((size_t) GGML_OPENCL_DIAG_MASK_INF_8_WG,
+                               backend_ctx->get_kernel_workgroup_size(kernel));
+        size_t global_work_size[] = { CEIL_DIV(n, lws) * lws, 1, 1 };
+        size_t local_work_size[] = { lws, 1, 1 };
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else {
