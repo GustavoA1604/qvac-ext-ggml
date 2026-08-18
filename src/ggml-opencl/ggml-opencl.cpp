@@ -78,6 +78,7 @@
 // by it.
 #define GGML_OPENCL_ARGMAX_WG 256
 #define GGML_OPENCL_PAD_F32_4_WG 256
+#define GGML_OPENCL_DIAG_MASK_INF_8_WG 64
 
 // Smallest ne01 still routed onto the tiled local-memory GEMM, on Adreno. Below it the
 // tile is mostly padding, and the matrix-vector kernel launches exactly ne01*ne11 outputs
@@ -805,8 +806,21 @@ struct ggml_backend_opencl_context {
         profiling_info.emplace_back();
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
 #else
-        GGML_UNUSED(tensor);
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
+        const cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            char kernel_name[256] = "unknown";
+            clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, NULL);
+            const size_t g0 = global_work_size ? global_work_size[0] : 0;
+            const size_t g1 = work_dim > 1 && global_work_size ? global_work_size[1] : 1;
+            const size_t g2 = work_dim > 2 && global_work_size ? global_work_size[2] : 1;
+            const size_t l0 = local_work_size ? local_work_size[0] : 0;
+            const size_t l1 = work_dim > 1 && local_work_size ? local_work_size[1] : 0;
+            const size_t l2 = work_dim > 2 && local_work_size ? local_work_size[2] : 0;
+            GGML_LOG_ERROR("ggml_opencl: clEnqueueNDRangeKernel error %d kernel=%s op=%s gws=[%zu,%zu,%zu] lws=%s[%zu,%zu,%zu]\n",
+                err, kernel_name, tensor ? ggml_op_name(tensor->op) : "null",
+                g0, g1, g2, local_work_size ? "set" : "null", l0, l1, l2);
+            GGML_ASSERT(0);
+        }
 #endif
     }
 
@@ -16009,6 +16023,7 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
 
     if (ne00%8 == 0) {
         kernel = backend_ctx->kernel_diag_mask_inf_8;
+        const int n = ne00*ne01*ne02/8;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
@@ -16017,9 +16032,12 @@ static void ggml_cl_diag_mask_inf(ggml_backend_t backend, const ggml_tensor * sr
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ne00));
         CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &ne01));
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &n_past));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &n));
 
-        size_t global_work_size[] = {(size_t)ne00*ne01*ne02/8, 1, 1};
-        size_t local_work_size[] = {64, 1, 1};
+        const size_t lws = MIN((size_t) GGML_OPENCL_DIAG_MASK_INF_8_WG,
+                               backend_ctx->get_kernel_workgroup_size(kernel));
+        size_t global_work_size[] = { CEIL_DIV((size_t)n, lws) * lws, 1, 1 };
+        size_t local_work_size[] = { lws, 1, 1 };
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else {
