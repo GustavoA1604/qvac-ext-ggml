@@ -503,6 +503,8 @@ struct ggml_backend_opencl_context {
     bool disable_fusion;
     int  gemv_wide_simdgroups;
     int  gemv_wide_max_m;
+    size_t gemv_wide_q4_max_workgroup_size = 0;
+    size_t gemv_wide_q8_max_workgroup_size = 0;
     int  mul_mm_min_m;
 
     bool adreno_has_large_buffer;
@@ -3253,6 +3255,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             cl_program prog_wide = build_program_from_source(
                 backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
             CL_CHECK((backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide = clCreateKernel(prog_wide, "kernel_gemv_noshuffle", &err), err));
+            backend_ctx->gemv_wide_q4_max_workgroup_size =
+                backend_ctx->get_kernel_workgroup_size(backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide);
             CL_CHECK(clReleaseProgram(prog_wide));
         }
         GGML_LOG_CONT(".");
@@ -3499,6 +3503,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             cl_program prog_wide = build_program_from_source(
                 backend_ctx->context, backend_ctx->device, kernel_src_CL_gemv_general.c_str(), CL_gemv_wide_opts);
             CL_CHECK((backend_ctx->CL_mul_mat_vec_q8_0_f32_wide = clCreateKernel(prog_wide, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
+            backend_ctx->gemv_wide_q8_max_workgroup_size =
+                backend_ctx->get_kernel_workgroup_size(backend_ctx->CL_mul_mat_vec_q8_0_f32_wide);
             CL_CHECK(clReleaseProgram(prog_wide));
         }
         GGML_LOG_CONT(".");
@@ -4897,8 +4903,16 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 // narrow matrix cannot fill the device however much weight traffic it has to move.
 // Splitting K across more waves is the one remaining source of parallelism, and each
 // wave still needs a share of K to be worth launching.
-static bool gemv_prefers_wide(const ggml_backend_opencl_context * backend_ctx, int M, int k_blocks) {
+static bool gemv_prefers_wide(
+        const ggml_backend_opencl_context * backend_ctx,
+        size_t kernel_max_workgroup_size,
+        int M,
+        int k_blocks) {
+    const size_t required_workgroup_size =
+        (size_t) backend_ctx->adreno_wave_size * backend_ctx->gemv_wide_simdgroups;
+
     return backend_ctx->gemv_wide_simdgroups > 0 &&
+           required_workgroup_size <= kernel_max_workgroup_size &&
            M <= backend_ctx->gemv_wide_max_m &&
            k_blocks >= backend_ctx->gemv_wide_simdgroups;
 }
@@ -12778,7 +12792,11 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
 
         kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32;
         int gemv_simdgroups = 4;
-        if (gemv_prefers_wide(backend_ctx, M, K / ggml_blck_size(GGML_TYPE_Q8_0))) {
+        if (gemv_prefers_wide(
+                backend_ctx,
+                backend_ctx->gemv_wide_q8_max_workgroup_size,
+                M,
+                K / ggml_blck_size(GGML_TYPE_Q8_0))) {
             kernel = backend_ctx->CL_mul_mat_vec_q8_0_f32_wide;
             gemv_simdgroups = backend_ctx->gemv_wide_simdgroups;
         }
@@ -13895,7 +13913,11 @@ static void ggml_cl_mul_mat_impl(ggml_backend_t backend, const ggml_tensor * src
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_11008_1_4096;
             } else if (M == 32000 && K == 4096) {
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_32000_1_4096;
-            } else if (gemv_prefers_wide(backend_ctx, M, K / ggml_blck_size(GGML_TYPE_Q4_0))) {
+            } else if (gemv_prefers_wide(
+                    backend_ctx,
+                    backend_ctx->gemv_wide_q4_max_workgroup_size,
+                    M,
+                    K / ggml_blck_size(GGML_TYPE_Q4_0))) {
                 kernel = backend_ctx->CL_mul_mat_vec_q4_0_f32_1d_4x_flat_general_wide;
                 gemv_simdgroups = backend_ctx->gemv_wide_simdgroups;
             }
