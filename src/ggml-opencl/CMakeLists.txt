@@ -9,6 +9,10 @@ ggml_add_backend_library(${TARGET_NAME}
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 
+if (ANDROID)
+    target_link_libraries(${TARGET_NAME} PRIVATE log)
+endif ()
+
 if (GGML_OPENCL_PROFILING)
     message(STATUS "OpenCL profiling enabled (increases CPU overhead)")
     add_compile_definitions(GGML_OPENCL_PROFILING)

@@ -15,6 +15,10 @@
 
 #include <CL/cl.h>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 #include <inttypes.h>
 #include <string.h>
 
@@ -29,6 +33,51 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+
+static constexpr size_t OPENCL_KERNEL_NAME_CAPACITY = 256;
+static constexpr size_t OPENCL_ENQUEUE_ERROR_CAPACITY = 512;
+static constexpr char OPENCL_LOG_TAG[] = "ggml-opencl";
+static constexpr char OPENCL_ENQUEUE_ERROR_FORMAT[] =
+    "clEnqueueNDRangeKernel error %d kernel=%s op=%s gws=[%zu,%zu,%zu] lws=%s[%zu,%zu,%zu]";
+
+static void log_opencl_enqueue_failure(
+        cl_int err,
+        cl_kernel kernel,
+        cl_uint work_dim,
+        const size_t * global_work_size,
+        const size_t * local_work_size,
+        const ggml_tensor * tensor) {
+    char kernel_name[OPENCL_KERNEL_NAME_CAPACITY] = "unknown";
+    clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, NULL);
+
+    const size_t g0 = global_work_size ? global_work_size[0] : 0;
+    const size_t g1 = work_dim > 1 && global_work_size ? global_work_size[1] : 1;
+    const size_t g2 = work_dim > 2 && global_work_size ? global_work_size[2] : 1;
+    const size_t l0 = local_work_size ? local_work_size[0] : 0;
+    const size_t l1 = work_dim > 1 && local_work_size ? local_work_size[1] : 0;
+    const size_t l2 = work_dim > 2 && local_work_size ? local_work_size[2] : 0;
+
+    char message[OPENCL_ENQUEUE_ERROR_CAPACITY];
+    std::snprintf(
+        message,
+        sizeof(message),
+        OPENCL_ENQUEUE_ERROR_FORMAT,
+        err,
+        kernel_name,
+        tensor ? ggml_op_name(tensor->op) : "null",
+        g0,
+        g1,
+        g2,
+        local_work_size ? "set" : "null",
+        l0,
+        l1,
+        l2);
+
+#ifdef __ANDROID__
+    __android_log_write(ANDROID_LOG_ERROR, OPENCL_LOG_TAG, message);
+#endif
+    GGML_LOG_ERROR("ggml_opencl: %s\n", message);
+}
 
 // qvac-parakeet patch: persistent kernel binary cache support. The
 // helpers below sit on POSIX file primitives (mkdir/unlink/fsync) but
@@ -808,17 +857,7 @@ struct ggml_backend_opencl_context {
 #else
         const cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
-            char kernel_name[256] = "unknown";
-            clGetKernelInfo(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kernel_name), kernel_name, NULL);
-            const size_t g0 = global_work_size ? global_work_size[0] : 0;
-            const size_t g1 = work_dim > 1 && global_work_size ? global_work_size[1] : 1;
-            const size_t g2 = work_dim > 2 && global_work_size ? global_work_size[2] : 1;
-            const size_t l0 = local_work_size ? local_work_size[0] : 0;
-            const size_t l1 = work_dim > 1 && local_work_size ? local_work_size[1] : 0;
-            const size_t l2 = work_dim > 2 && local_work_size ? local_work_size[2] : 0;
-            GGML_LOG_ERROR("ggml_opencl: clEnqueueNDRangeKernel error %d kernel=%s op=%s gws=[%zu,%zu,%zu] lws=%s[%zu,%zu,%zu]\n",
-                err, kernel_name, tensor ? ggml_op_name(tensor->op) : "null",
-                g0, g1, g2, local_work_size ? "set" : "null", l0, l1, l2);
+            log_opencl_enqueue_failure(err, kernel, work_dim, global_work_size, local_work_size, tensor);
             GGML_ASSERT(0);
         }
 #endif
