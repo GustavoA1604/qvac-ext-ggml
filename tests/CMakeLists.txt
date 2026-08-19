@@ -413,8 +413,6 @@ if (NOT GGML_BACKEND_DL)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 endif()
 
-# Outside the GGML_BACKEND_DL guard: the guard resolves its backend through
-# the registry, and a dynamic-backend build is what a CUDA consumer ships.
 set(TEST_TARGET test-conv-transpose-1d-scaling)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)

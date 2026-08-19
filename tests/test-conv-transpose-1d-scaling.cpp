@@ -183,7 +183,9 @@ outcome check_one_device(ggml_backend_dev_t device) {
 
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
     if (!backend) {
-        return outcome::skipped;
+        printf("  %s: FAIL device did not initialise, so the cost model went unchecked\n",
+               ggml_backend_dev_name(device));
+        return outcome::failed;
     }
 
     const outcome result = check_backend(backend);
