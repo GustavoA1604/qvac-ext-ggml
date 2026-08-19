@@ -1,5 +1,19 @@
 #include "conv-transpose-1d.cuh"
 
+// The half-open range of input positions whose kernel window covers out_pos:
+// i*s0 <= out_pos < i*s0 + kernel_size, clamped to the input.
+struct conv_transpose_1d_tap_range {
+    int first;
+    int last;
+};
+
+static __device__ __forceinline__ conv_transpose_1d_tap_range conv_transpose_1d_taps(
+        const int out_pos, const int kernel_size, const int s0, const int input_size) {
+    const int first = out_pos >= kernel_size ? (out_pos - kernel_size) / s0 + 1 : 0;
+    const int last  = min(out_pos / s0, input_size - 1);
+    return { first, last };
+}
+
 static  __global__ void conv_transpose_1d_kernel(
         const int s0, const int p0, const int d0, const int output_size,
         const int src0_ne0, const int src0_ne1, const int src0_ne2, const int src0_ne3,
@@ -12,19 +26,18 @@ static  __global__ void conv_transpose_1d_kernel(
     }
 
     int out_index = global_index / dst_ne0;
+    int idx       = global_index % dst_ne0;
+
+    const conv_transpose_1d_tap_range taps =
+        conv_transpose_1d_taps(idx, src0_ne0, s0, src1_ne0);
 
     float accumulator = 0;
 
     for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
-
         int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
         int input_offset = src1_ne0 * c;
 
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
-            }
+        for (int i = taps.first; i <= taps.last; i++) {
             int weight_idx = idx - i*s0;
 
             float kernel_weight = src0[kernel_offset + weight_idx];

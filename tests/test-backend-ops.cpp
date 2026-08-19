@@ -9501,6 +9501,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32000, 512, 1, 1}));
 
+    // HiFT vocoder shapes: three upsample stages and the closing ISTFT. Cost
+    // per output element depends only on the kernel taps that reach it, so
+    // these stay flat as the audio axis grows; an implementation that instead
+    // walks the whole input per output element shows up here as the input
+    // length climbs across the four cases.
+    test_cases.emplace_back(new test_conv_transpose_1d({284, 512, 1, 1}, {16, 256, 512, 1}, 8, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({2272, 256, 1, 1}, {11, 128, 256, 1}, 5, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({11360, 128, 1, 1}, {7, 64, 128, 1}, 3, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({34077, 18, 1, 1}, {16, 1, 18, 1}, 4, 0, 1));
+
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {512, 34, 2, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 1, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 4, 1}));
