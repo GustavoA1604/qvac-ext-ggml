@@ -2,9 +2,6 @@
 
 #include <stdint.h>
 
-#define MAX_GRIDDIM_Y 65535
-#define MAX_GRIDDIM_Z 65535
-
 __device__ __forceinline__ int64_t wrap_around(int64_t coord, int64_t size) {
     // + size ensures negatives are handled properly
     return (coord + size) % size;
@@ -15,23 +12,17 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
                                const int lp2, const int rp2, const int lp3, const int rp3,
                                const int ne0, const int ne1, const int ne2, const int ne3,
                                const bool circular) {
-    // blockIdx.z: i3*ne2+i2
-    // blockIDx.x: i0 / CUDA_PAD_BLOCK_SIZE
-    // The row axis and the batch/channel axis are strided rather than mapped
-    // one-to-one onto the grid: either can exceed the 65535 dimension limit,
-    // which a padded audio time axis routinely does.
     const int i0 = threadIdx.x + blockIdx.x * blockDim.x;
     if (i0 >= ne0) {
         return;
     }
-    const int ne2_ne3 = ne2 * ne3;
 
-    for (int i1 = blockIdx.y; i1 < ne1; i1 += gridDim.y) {
-    for (int iz = blockIdx.z; iz < ne2_ne3; iz += gridDim.z) {
+    ggml_cuda_for_each_grid_y(ne1, [&](const int64_t i1) {
+    ggml_cuda_for_each_grid_z(int64_t(ne2) * ne3, [&](const int64_t iz) {
     const int i2 = iz % ne2;
     const int i3 = iz / ne2;
 
-    const int64_t dst_idx = i3 * (ne0 * ne1 * ne2) + i2 * (ne0 * ne1) + i1 * ne0 + i0;
+    const int64_t dst_idx = int64_t(i3) * ne0 * ne1 * ne2 + int64_t(i2) * ne0 * ne1 + i1 * ne0 + i0;
 
     if (!circular) {
         if ((i0 >= lp0 && i0 < ne0 - rp0) && (i1 >= lp1 && i1 < ne1 - rp1) && (i2 >= lp2 && i2 < ne2 - rp2) &&
@@ -64,8 +55,8 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
 
         dst[dst_idx] = src[src_idx];
     }
-    }
-    }
+    });
+    });
 }
 
 
@@ -75,7 +66,7 @@ static void pad_f32_cuda(const float * src, size_t s00, size_t s01, size_t s02, 
     const int ne0, const int ne1, const int ne2, const int ne3,
     const bool circular, cudaStream_t stream) {
     int  num_blocks = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
-    dim3 gridDim(num_blocks, MIN(ne1, MAX_GRIDDIM_Y), MIN(ne2 * ne3, MAX_GRIDDIM_Z));
+    dim3 gridDim(num_blocks, MIN(ne1, GGML_CUDA_MAX_GRIDDIM_Y), MIN(ne2 * ne3, GGML_CUDA_MAX_GRIDDIM_Z));
     pad_f32<<<gridDim, CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
                                                          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3,
                                                          ne0, ne1, ne2, ne3, circular);

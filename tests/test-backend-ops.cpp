@@ -8003,10 +8003,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {5, 5, 1, 32}, {3, 4, 1, 32}, 1, 1, 0, 0, 1, 1, true));
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {2, 2, 1536, 729}, {2, 2, 1536, 4096}, 1, 1, 0, 0, 1, 1, true));
 
+    // Output width past the 65535 CUDA grid-dimension limit. 1D mode keeps the
+    // tensor small while still driving OW well past the bound.
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {70000, 1, 1, 1}, {3, 1, 1, 1}, 1, 0, 0, 0, 1, 0, false));
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {70000, 1, 1, 1}, {3, 1, 1, 1}, 1, 0, 1, 0, 1, 0, false));
+
     // im2col 3D
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // Same grid-dimension bound on the 3D kernel, which carries the identical mapping.
+    test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {70000, 1, 1, 1}, {2, 1, 1, 1}, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, false));
+
     for (int s0 : {1, 3}) {
         for (int s1 : {1, 3}) {
             for (int s2 : {1, 3}) {
@@ -9239,6 +9247,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {96, 1024, 1, 1}, 0, 0, 6, 0, 0, 0, 0, 0));
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {192, 512, 1, 1}, 0, 0, 54, 3, 0, 0, 0, 0));
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 3, 2}, 0, 0, 1, 2, 1, 1, 1, 0));
+    // Axes past the 65535 CUDA grid-dimension limit, which a backend mapping an
+    // axis one-to-one onto the grid cannot launch. ne1 and ne2*ne3 are exceeded
+    // separately so a failure names the axis.
+    for (bool circular : {false, true}) {
+        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 70000, 1, 1}, 0, 0, 1, 2, 0, 0, 0, 0, 0, circular));
+        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 70000, 1}, 0, 0, 0, 0, 1, 2, 0, 0, 0, circular));
+        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 300, 250}, 0, 0, 0, 0, 1, 0, 1, 0, 0, circular));
+    }
+
     // Neighbours that must keep taking the general path: dim0 padded, and ne0 % 4 != 0.
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 1, 1}, 1, 0, 1, 1, 0, 0, 0, 0));
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {6, 32, 1, 1}, 0, 0, 1, 1, 0, 0, 0, 0));
