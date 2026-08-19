@@ -11,6 +11,8 @@ namespace {
 
 constexpr int64_t KERNEL_SIZE       = 16;
 constexpr int64_t STRIDE            = 4;
+constexpr int     PADDING           = 0;
+constexpr int     DILATION          = 1;
 constexpr int64_t CHANNELS_IN       = 18;
 constexpr int64_t CHANNELS_OUT      = 1;
 constexpr int64_t SATURATING_INPUT  = 16384;
@@ -22,7 +24,7 @@ constexpr size_t  CONTEXT_BYTES     = size_t(32) * 1024 * 1024;
 constexpr float   KERNEL_FILL       = 0.01f;
 constexpr float   INPUT_FILL        = 0.02f;
 constexpr int     CTEST_SKIP_STATUS = 77;
-constexpr const char * CUDA_REGISTRY = "CUDA";
+constexpr const char * GGML_CUDA_REGISTRIES[] = { "CUDA", "ROCm", "MUSA" };
 
 enum class outcome { passed, failed, skipped };
 
@@ -44,7 +46,7 @@ ggml_tensor * build_conv_transpose_1d(ggml_context * ctx, int64_t input_length) 
     ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_length, CHANNELS_IN);
     ggml_set_name(input, "input");
 
-    return ggml_conv_transpose_1d(ctx, kernel, input, STRIDE, 0, 1);
+    return ggml_conv_transpose_1d(ctx, kernel, input, STRIDE, PADDING, DILATION);
 }
 
 bool backend_supports_conv_transpose_1d(ggml_backend_t backend) {
@@ -160,20 +162,22 @@ outcome check_backend(ggml_backend_t backend) {
     return outcome::passed;
 }
 
-// Every backend porting the CUDA kernel inherits its cost model -- ggml-sycl
-// carries the same full-input scan -- so an unrestricted walk would run the
-// scaled case on a backend that takes trillions of iterations to finish it.
-bool device_is_cuda(ggml_backend_dev_t device) {
-    ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
-    if (!registry) {
-        return false;
+bool registry_compiles_ggml_cuda_kernels(const char * name) {
+    for (const char * candidate : GGML_CUDA_REGISTRIES) {
+        if (name && std::strcmp(name, candidate) == 0) {
+            return true;
+        }
     }
-    const char * name = ggml_backend_reg_name(registry);
-    return name && std::strcmp(name, CUDA_REGISTRY) == 0;
+    return false;
+}
+
+bool device_compiles_ggml_cuda_kernels(ggml_backend_dev_t device) {
+    ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+    return registry && registry_compiles_ggml_cuda_kernels(ggml_backend_reg_name(registry));
 }
 
 outcome check_one_device(ggml_backend_dev_t device) {
-    if (!device_is_cuda(device)) {
+    if (!device_compiles_ggml_cuda_kernels(device)) {
         return outcome::skipped;
     }
 
@@ -210,7 +214,7 @@ int main() {
         case outcome::failed:
             return 1;
         case outcome::skipped:
-            printf("no CUDA backend supporting CONV_TRANSPOSE_1D; nothing to check\n");
+            printf("no ggml-cuda backend supporting CONV_TRANSPOSE_1D; nothing to check\n");
             return CTEST_SKIP_STATUS;
         case outcome::passed:
             printf("OK\n");
