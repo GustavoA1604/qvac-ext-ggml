@@ -12,13 +12,26 @@ static __device__ __forceinline__ conv_transpose_1d_tap_range conv_transpose_1d_
     return { first, last_inclusive };
 }
 
-// Takes and returns the running sum so the caller's accumulation order over
-// channels and taps is the one a single flat loop would produce.
 static __device__ __forceinline__ float conv_transpose_1d_accumulate_taps(
         const float * kernel_channel, const float * input_channel, const int out_pos,
         const int s0, const conv_transpose_1d_tap_range taps, float accumulator) {
     for (int i = taps.first; i <= taps.last_inclusive; i++) {
         accumulator += kernel_channel[out_pos - i*s0] * input_channel[i];
+    }
+    return accumulator;
+}
+
+static __device__ __forceinline__ float conv_transpose_1d_accumulate_channels(
+        const float * src0, const float * src1, const int channels, const int out_index,
+        const int out_pos, const int s0, const int kernel_size, const int kernel_channel_stride,
+        const int input_channel_stride, const conv_transpose_1d_tap_range taps,
+        float accumulator) {
+    for (int c = 0; c < channels; c++) {
+        const float * kernel_channel = src0 + kernel_channel_stride * c + out_index * kernel_size;
+        const float * input_channel  = src1 + input_channel_stride * c;
+
+        accumulator = conv_transpose_1d_accumulate_taps(
+            kernel_channel, input_channel, out_pos, s0, taps, accumulator);
     }
     return accumulator;
 }
@@ -40,16 +53,9 @@ static  __global__ void conv_transpose_1d_kernel(
     const conv_transpose_1d_tap_range taps =
         conv_transpose_1d_taps(idx, src0_ne0, s0, src1_ne0);
 
-    float accumulator = 0;
-
-    for (int c = 0; c < src0_ne2; c++) {
-        const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        const int input_offset  = src1_ne0 * c;
-
-        accumulator = conv_transpose_1d_accumulate_taps(
-            src0 + kernel_offset, src1 + input_offset, idx, s0, taps, accumulator);
-    }
-    dst[global_index] = accumulator;
+    dst[global_index] = conv_transpose_1d_accumulate_channels(
+        src0, src1, src0_ne2, out_index, idx, s0, src0_ne0,
+        src0_ne0 * src0_ne1, src1_ne0, taps, /*accumulator=*/0.0f);
     GGML_UNUSED_VARS(p0, d0, src0_ne3, src1_ne3, dst_ne3, src1_ne1, dst_ne1, src1_ne2, dst_ne2);
 }
 
