@@ -9256,6 +9256,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 300, 250}, 0, 0, 0, 0, 1, 0, 1, 0, 0, circular));
     }
 
+    // Launch-size boundary: the grid extents are clamped at 65535, so the
+    // element either side of the clamp exercises both the clamped and the
+    // unclamped launch. The last pair reaches the z extent as ne2*ne3 rather
+    // than a single axis, so a product computed in the wrong width shows up
+    // here and not in the single-axis cases above.
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 65535, 1, 1}, 0, 0, 1, 0, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 65536, 1, 1}, 0, 0, 1, 0, 0, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 65535, 1}, 0, 0, 0, 0, 1, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 65536, 1}, 0, 0, 0, 0, 1, 0, 0, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 255, 257}, 0, 0, 0, 0, 1, 0, 1, 0));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {2, 1, 256, 256}, 0, 0, 0, 0, 1, 0, 1, 0));
+
     // Neighbours that must keep taking the general path: dim0 padded, and ne0 % 4 != 0.
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {64, 32, 1, 1}, 1, 0, 1, 1, 0, 0, 0, 0));
     test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {6, 32, 1, 1}, 0, 0, 1, 1, 0, 0, 0, 0));
