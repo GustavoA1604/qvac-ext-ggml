@@ -8207,6 +8207,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {3,2,2,1}, 1, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {3,1,2,1}, 1, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({2,1,1,1}, {3,1,1,1}, 1, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({64,18,1,1}, {16,1,18,1}, 1, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({64,18,1,1}, {16,1,18,1}, 16, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({64,18,1,1}, {16,1,18,1}, 17, 0, 1));
 
     for (ggml_type kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_conv_transpose_2d({3, 2, 3, 1}, {2, 2, 1, 3}, 1, kernel_type));
@@ -9500,6 +9503,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32000, 512, 1, 1}));
+
+    test_cases.emplace_back(new test_conv_transpose_1d({284, 512, 1, 1}, {16, 256, 512, 1}, 8, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({2272, 256, 1, 1}, {11, 128, 256, 1}, 5, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({11360, 128, 1, 1}, {7, 64, 128, 1}, 3, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({34077, 18, 1, 1}, {16, 1, 18, 1}, 4, 0, 1));
 
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {512, 34, 2, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 1, 1}));

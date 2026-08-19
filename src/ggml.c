@@ -4574,6 +4574,7 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == 1);
 
+    GGML_ASSERT(s0 > 0);
     GGML_ASSERT(p0 == 0);
     GGML_ASSERT(d0 == 1);
 

@@ -1,5 +1,41 @@
 #include "conv-transpose-1d.cuh"
 
+struct conv_transpose_1d_tap_range {
+    int first;
+    int last_inclusive;
+};
+
+static __device__ __forceinline__ conv_transpose_1d_tap_range conv_transpose_1d_taps(
+        const int out_pos, const int kernel_size, const int s0, const int input_size) {
+    const int first          = out_pos >= kernel_size ? (out_pos - kernel_size) / s0 + 1 : 0;
+    const int last_inclusive = min(out_pos / s0, input_size - 1);
+    return { first, last_inclusive };
+}
+
+static __device__ __forceinline__ float conv_transpose_1d_accumulate_taps(
+        const float * kernel_channel, const float * input_channel, const int out_pos,
+        const int s0, const conv_transpose_1d_tap_range taps, float accumulator) {
+    for (int i = taps.first; i <= taps.last_inclusive; i++) {
+        accumulator += kernel_channel[out_pos - i*s0] * input_channel[i];
+    }
+    return accumulator;
+}
+
+static __device__ __forceinline__ float conv_transpose_1d_accumulate_channels(
+        const float * src0, const float * src1, const int channels, const int out_index,
+        const int out_pos, const int s0, const int kernel_size, const int kernel_channel_stride,
+        const int input_channel_stride, const conv_transpose_1d_tap_range taps,
+        float accumulator) {
+    for (int c = 0; c < channels; c++) {
+        const float * kernel_channel = src0 + kernel_channel_stride * c + out_index * kernel_size;
+        const float * input_channel  = src1 + input_channel_stride * c;
+
+        accumulator = conv_transpose_1d_accumulate_taps(
+            kernel_channel, input_channel, out_pos, s0, taps, accumulator);
+    }
+    return accumulator;
+}
+
 static  __global__ void conv_transpose_1d_kernel(
         const int s0, const int p0, const int d0, const int output_size,
         const int src0_ne0, const int src0_ne1, const int src0_ne2, const int src0_ne3,
@@ -12,28 +48,14 @@ static  __global__ void conv_transpose_1d_kernel(
     }
 
     int out_index = global_index / dst_ne0;
+    int idx       = global_index % dst_ne0;
 
-    float accumulator = 0;
+    const conv_transpose_1d_tap_range taps =
+        conv_transpose_1d_taps(idx, src0_ne0, s0, src1_ne0);
 
-    for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
-
-        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        int input_offset = src1_ne0 * c;
-
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
-            }
-            int weight_idx = idx - i*s0;
-
-            float kernel_weight = src0[kernel_offset + weight_idx];
-            float input_value =  src1[input_offset+i];
-
-            accumulator += kernel_weight * input_value;
-        }
-    }
-    dst[global_index] = accumulator;
+    dst[global_index] = conv_transpose_1d_accumulate_channels(
+        src0, src1, src0_ne2, out_index, idx, s0, src0_ne0,
+        src0_ne0 * src0_ne1, src1_ne0, taps, /*accumulator=*/0.0f);
     GGML_UNUSED_VARS(p0, d0, src0_ne3, src1_ne3, dst_ne3, src1_ne1, dst_ne1, src1_ne2, dst_ne2);
 }
 
