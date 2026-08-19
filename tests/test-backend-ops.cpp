@@ -8207,6 +8207,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {3,2,2,1}, 1, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({3,2,1,1}, {3,1,2,1}, 1, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({2,1,1,1}, {3,1,1,1}, 1, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({64,18,1,1}, {16,1,18,1}, 1, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({64,18,1,1}, {16,1,18,1}, 16, 0, 1));
+    test_cases.emplace_back(new test_conv_transpose_1d({64,18,1,1}, {16,1,18,1}, 17, 0, 1));
 
     for (ggml_type kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_conv_transpose_2d({3, 2, 3, 1}, {2, 2, 1, 3}, 1, kernel_type));
