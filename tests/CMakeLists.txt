@@ -321,6 +321,13 @@ if (NOT GGML_BACKEND_DL)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+    # test-conv-transpose-1d-scaling
+
+    set(TEST_TARGET test-conv-transpose-1d-scaling)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
     #
     # test-dup
 

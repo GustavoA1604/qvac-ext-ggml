@@ -1,17 +1,26 @@
 #include "conv-transpose-1d.cuh"
 
-// The half-open range of input positions whose kernel window covers out_pos:
-// i*s0 <= out_pos < i*s0 + kernel_size, clamped to the input.
 struct conv_transpose_1d_tap_range {
     int first;
-    int last;
+    int last_inclusive;
 };
 
 static __device__ __forceinline__ conv_transpose_1d_tap_range conv_transpose_1d_taps(
         const int out_pos, const int kernel_size, const int s0, const int input_size) {
-    const int first = out_pos >= kernel_size ? (out_pos - kernel_size) / s0 + 1 : 0;
-    const int last  = min(out_pos / s0, input_size - 1);
-    return { first, last };
+    const int first          = out_pos >= kernel_size ? (out_pos - kernel_size) / s0 + 1 : 0;
+    const int last_inclusive = min(out_pos / s0, input_size - 1);
+    return { first, last_inclusive };
+}
+
+// Takes and returns the running sum so the caller's accumulation order over
+// channels and taps is the one a single flat loop would produce.
+static __device__ __forceinline__ float conv_transpose_1d_accumulate_taps(
+        const float * kernel_channel, const float * input_channel, const int out_pos,
+        const int s0, const conv_transpose_1d_tap_range taps, float accumulator) {
+    for (int i = taps.first; i <= taps.last_inclusive; i++) {
+        accumulator += kernel_channel[out_pos - i*s0] * input_channel[i];
+    }
+    return accumulator;
 }
 
 static  __global__ void conv_transpose_1d_kernel(
@@ -34,17 +43,11 @@ static  __global__ void conv_transpose_1d_kernel(
     float accumulator = 0;
 
     for (int c = 0; c < src0_ne2; c++) {
-        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        int input_offset = src1_ne0 * c;
+        const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+        const int input_offset  = src1_ne0 * c;
 
-        for (int i = taps.first; i <= taps.last; i++) {
-            int weight_idx = idx - i*s0;
-
-            float kernel_weight = src0[kernel_offset + weight_idx];
-            float input_value =  src1[input_offset+i];
-
-            accumulator += kernel_weight * input_value;
-        }
+        accumulator = conv_transpose_1d_accumulate_taps(
+            src0 + kernel_offset, src1 + input_offset, idx, s0, taps, accumulator);
     }
     dst[global_index] = accumulator;
     GGML_UNUSED_VARS(p0, d0, src0_ne3, src1_ne3, dst_ne3, src1_ne1, dst_ne1, src1_ne2, dst_ne2);
