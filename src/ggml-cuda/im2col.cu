@@ -1,7 +1,5 @@
 #include "im2col.cuh"
 
-#define MAX_GRIDDIM_Z 65535
-
 template <typename T>
 static  __global__ void im2col_kernel(
         const float * x, T * dst,
@@ -18,8 +16,8 @@ static  __global__ void im2col_kernel(
     const int64_t ikh = rem / KW;
     const int64_t ikw = rem - ikh * KW;
 
-    const int64_t  iow = blockIdx.y;
-    for (int64_t iz = blockIdx.z; iz < N_OH; iz+=MAX_GRIDDIM_Z) {
+    ggml_cuda_for_each_grid_y(OW, [&](const int64_t iow) {
+    ggml_cuda_for_each_grid_z(N_OH, [&](const int64_t iz) {
         const int64_t  in = iz / OH;
         const int64_t  ioh = iz - in * OH;
 
@@ -35,7 +33,8 @@ static  __global__ void im2col_kernel(
             const int64_t offset_src = iic * IC_IH_IW + in * IH_IW;
             dst[offset_dst] = x[offset_src + iih * IW + iiw];
         }
-    }
+    });
+    });
 
     GGML_UNUSED(IC);
     GGML_UNUSED(KH);
@@ -51,7 +50,7 @@ static void im2col_cuda(const float * x, T* dst,
     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
-    dim3 block_nums(num_blocks, OW, MIN(N_OH, MAX_GRIDDIM_Z));
+    dim3 block_nums(num_blocks, MIN(OW, GGML_CUDA_MAX_GRIDDIM_Y), MIN(N_OH, GGML_CUDA_MAX_GRIDDIM_Z));
     im2col_kernel<<<block_nums, MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
                                                                                      IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
                                                                                      s0, s1, p0, p1, d0, d1);
@@ -128,7 +127,7 @@ static  __global__ void im2col_3d_kernel(
     if (i >= IC_KD_KH_KW) {
         return;
     }
-    GGML_UNUSED(N); GGML_UNUSED(OC); GGML_UNUSED(OH_OW); GGML_UNUSED(OD); GGML_UNUSED(OW); GGML_UNUSED(KD); GGML_UNUSED(KH);
+    GGML_UNUSED(N); GGML_UNUSED(OC); GGML_UNUSED(OH_OW); GGML_UNUSED(OD); GGML_UNUSED(KD); GGML_UNUSED(KH);
     GGML_UNUSED(ID_IH_IW); GGML_UNUSED(IH_IW); GGML_UNUSED(IC_ID_IH_IW); GGML_UNUSED(OW_KD_KH_KW);
 
     const int64_t iic = i / KD_KH_KW;
@@ -136,8 +135,8 @@ static  __global__ void im2col_3d_kernel(
     const int64_t ikh = (i - iic * KD_KH_KW - ikd * KH_KW) / KW;
     const int64_t ikw = i % KW;
 
-    const int64_t  iow = blockIdx.y;
-    for (int64_t iz = blockIdx.z; iz < N_OD_OH; iz+=MAX_GRIDDIM_Z) {
+    ggml_cuda_for_each_grid_y(OW, [&](const int64_t iow) {
+    ggml_cuda_for_each_grid_z(N_OD_OH, [&](const int64_t iz) {
         const int64_t in  = iz / OD_OH;
         const int64_t iod = (iz - in*OD_OH) / OH;
         const int64_t ioh = iz % OH;
@@ -154,7 +153,8 @@ static  __global__ void im2col_3d_kernel(
             const int64_t offset_src = ((in * IC + iic) * stride_q) + (iid * stride_z) + (iih * stride_y) + (iiw * stride_x);
             dst[offset_dst] = src[offset_src];
         }
-    }
+    });
+    });
 }
 
 // [N*IC, ID, IH, IW] => [N*OD, OH, OW, IC * KD * KH * KW]
@@ -178,7 +178,7 @@ static void im2col_3d_cuda(const float * src, T* dst,
     const int64_t OH_OW_IC_KD_KH_KW = OH*OW*IC*KD*KH*KW;
     const int64_t OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
     const int64_t num_blocks = (IC_KD_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
-    dim3 block_nums(num_blocks, OW, MIN(N_OD_OH, MAX_GRIDDIM_Z));
+    dim3 block_nums(num_blocks, MIN(OW, GGML_CUDA_MAX_GRIDDIM_Y), MIN(N_OD_OH, GGML_CUDA_MAX_GRIDDIM_Z));
     im2col_3d_kernel<<<block_nums, MIN(IC_KD_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
                                                                                            OH_OW, KD_KH_KW, ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW,
                                                                                            IC_KD_KH_KW, OW_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW,
