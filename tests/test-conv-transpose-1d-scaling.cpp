@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -21,6 +22,7 @@ constexpr size_t  CONTEXT_BYTES     = size_t(32) * 1024 * 1024;
 constexpr float   KERNEL_FILL       = 0.01f;
 constexpr float   INPUT_FILL        = 0.02f;
 constexpr int     CTEST_SKIP_STATUS = 77;
+constexpr const char * CUDA_REGISTRY = "CUDA";
 
 enum class outcome { passed, failed, skipped };
 
@@ -67,6 +69,9 @@ timing time_one_run(ggml_backend_t backend, ggml_cgraph * graph) {
 
 timing fastest_of_timed_runs(ggml_backend_t backend, ggml_cgraph * graph) {
     timing fastest = time_one_run(backend, graph);
+    if (!fastest.ok) {
+        return fastest;
+    }
     for (int run = 1; run < TIMED_RUNS; run++) {
         const timing current = time_one_run(backend, graph);
         if (!current.ok) {
@@ -155,13 +160,20 @@ outcome check_backend(ggml_backend_t backend) {
     return outcome::passed;
 }
 
-bool device_is_gpu(ggml_backend_dev_t device) {
-    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
-    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+// Every backend porting the CUDA kernel inherits its cost model -- ggml-sycl
+// carries the same full-input scan -- so an unrestricted walk would run the
+// scaled case on a backend that takes trillions of iterations to finish it.
+bool device_is_cuda(ggml_backend_dev_t device) {
+    ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+    if (!registry) {
+        return false;
+    }
+    const char * name = ggml_backend_reg_name(registry);
+    return name && std::strcmp(name, CUDA_REGISTRY) == 0;
 }
 
 outcome check_one_device(ggml_backend_dev_t device) {
-    if (!device_is_gpu(device)) {
+    if (!device_is_cuda(device)) {
         return outcome::skipped;
     }
 
@@ -198,7 +210,7 @@ int main() {
         case outcome::failed:
             return 1;
         case outcome::skipped:
-            printf("no GPU backend supporting CONV_TRANSPOSE_1D; nothing to check\n");
+            printf("no CUDA backend supporting CONV_TRANSPOSE_1D; nothing to check\n");
             return CTEST_SKIP_STATUS;
         case outcome::passed:
             printf("OK\n");
