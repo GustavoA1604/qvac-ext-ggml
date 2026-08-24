@@ -86,6 +86,12 @@ verified mechanisms.
   graph (encode + fence) vs ~5.3 ms GPU compute; graph/gallocr REBUILD cost
   is minor by comparison (LMGraphCache in the audiogen engine removed it;
   wall barely moved). Command-buffer replay would be the next lever.
+- IM2COL dst-binding trap: on devices with BDA + int64, ggml_vk_op_f32 binds
+  the im2col dst descriptor as a 1-BYTE DUMMY (the stock shaders write via
+  buffer device address). Any new non-BDA pipeline dispatched under
+  GGML_OP_IM2COL/IM2COL_3D silently writes into the dummy and produces
+  garbage with no error; the real dst must be bound for such pipelines
+  (see the tiled_1d exception at the IM2COL dispatch branch).
 - PRE-EXISTING switch-label hazard in ggml_vk_op_f32's elements switch:
   splitting an op out of a shared case-label list silently reroutes the
   remaining labels if the new case is appended at the list tail (cost: lost
