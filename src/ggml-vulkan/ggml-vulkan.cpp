@@ -783,6 +783,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
+    vk_pipeline pipeline_cpy_transpose_large_16, pipeline_cpy_transpose_large_32;
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
@@ -4773,6 +4774,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_32, "cpy_transpose_32", cpy_transpose_32_len, cpy_transpose_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_16, "cpy_transpose_16", cpy_transpose_16_len, cpy_transpose_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    // 512 threads and a 64x129-uint tile; devices below those limits keep the
+    // 32x32 pipeline for every size.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+        device->properties.limits.maxComputeSharedMemorySize >= 64 * 129 * 4) {
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_large_32, "cpy_transpose_large_32", cpy_transpose_large_32_len, cpy_transpose_large_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_large_16, "cpy_transpose_large_16", cpy_transpose_large_16_len, cpy_transpose_large_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q1_0], "cpy_f32_q1_0", cpy_f32_q1_0_len, cpy_f32_q1_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_0], "cpy_f32_q4_0", cpy_f32_q4_0_len, cpy_f32_q4_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
@@ -7911,10 +7919,15 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
     bool transpose = dst && src->nb[1] == ggml_type_size(to) && ggml_are_same_shape(dst, src);
 
     if (transpose && src->type == to) {
+        // Above the last-level-cache scale, the 64x128 tile's wider contiguous
+        // segments beat the 32x32 tile by an order of magnitude on strided DRAM
+        // reads (measured on Strix Halo: 5 -> ~100 GB/s).
+        const bool large = ggml_nbytes(src) >= 32 * 1024 * 1024 &&
+                           ctx->device->pipeline_cpy_transpose_large_32 != nullptr;
         if (ggml_type_size(to) == 4) {
-            return ctx->device->pipeline_cpy_transpose_32;
+            return large ? ctx->device->pipeline_cpy_transpose_large_32 : ctx->device->pipeline_cpy_transpose_32;
         } else if (ggml_type_size(to) == 2) {
-            return ctx->device->pipeline_cpy_transpose_16;
+            return large ? ctx->device->pipeline_cpy_transpose_large_16 : ctx->device->pipeline_cpy_transpose_16;
         }
     }
 
@@ -10924,22 +10937,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_UNARY:
     case GGML_OP_GLU:
     case GGML_OP_CONV_2D_DW:
-    case GGML_OP_COL2IM_1D:
-        if (pipeline == ctx->device->pipeline_col2im_1d_tiled_f32) {
-            const uint32_t OC = (uint32_t) ggml_get_op_params_i32(dst, 1);
-            elements = { (uint32_t) CEIL_DIV(dst->ne[0], COL2IM_1D_TILE_T),
-                         CEIL_DIV(OC, COL2IM_1D_TILE_OC), 1 };
-        } else {
-            const uint32_t ne = (uint32_t) ggml_nelements(dst);
-            if (ne > 262144) {
-                elements = { 512, 512, CEIL_DIV(ne, 262144) };
-            } else if (ne > 512) {
-                elements = { 512, CEIL_DIV(ne, 512), 1 };
-            } else {
-                elements = { ne, 1, 1 };
-            }
-        }
-        break;
     case GGML_OP_ZERO_UPSAMPLE:
     case GGML_OP_CHANNEL_SHUFFLE:
     case GGML_OP_AFFINE_PRELU:
@@ -10969,7 +10966,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { ne, 1, 1 };
             }
 
-            if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
+            if (pipeline == ctx->device->pipeline_cpy_transpose_large_32 ||
+                pipeline == ctx->device->pipeline_cpy_transpose_large_16) {
+                // 64x128 tiles (copy_transpose_large.comp)
+                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 64);
+                elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 128);
+                elements[2] = (uint32_t)(dst->ne[2]*dst->ne[3]);
+                elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+                elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+            } else if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
                 pipeline == ctx->device->pipeline_cpy_transpose_16) {
                 // 32x32 tiles
                 elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
@@ -10988,6 +10994,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements[2] = 1;
             }
         } break;
+    case GGML_OP_COL2IM_1D:
+        if (pipeline == ctx->device->pipeline_col2im_1d_tiled_f32) {
+            const uint32_t OC = (uint32_t) ggml_get_op_params_i32(dst, 1);
+            elements = { (uint32_t) CEIL_DIV(dst->ne[0], COL2IM_1D_TILE_T),
+                         CEIL_DIV(OC, COL2IM_1D_TILE_OC), 1 };
+        } else {
+            const uint32_t ne = (uint32_t) ggml_nelements(dst);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
     case GGML_OP_ADD_ID:
         {
             elements = { (uint32_t)ne01, (uint32_t)ne02, 1 };
