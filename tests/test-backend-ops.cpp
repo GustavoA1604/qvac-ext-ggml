@@ -8007,6 +8007,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // tensor small while still driving OW well past the bound.
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {70000, 1, 1, 1}, {3, 1, 1, 1}, 1, 0, 0, 0, 1, 0, false));
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {70000, 1, 1, 1}, {3, 1, 1, 1}, 1, 0, 1, 0, 1, 0, false));
+    // >=32 MiB 1D columns engage the Vulkan tiled im2col pipeline; ragged
+    // OW/IC and dilation cover the tile-boundary and window checks.
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {90001, 130, 1, 1}, {7, 130, 8, 1}, 1, 0, 9, 0, 3, 0, false));
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {70001, 129, 1, 1}, {1, 129, 8, 1}, 1, 0, 0, 0, 1, 0, false));
 
     // im2col 3D
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));

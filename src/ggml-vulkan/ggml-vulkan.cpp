@@ -864,6 +864,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_count_equal_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+    vk_pipeline pipeline_im2col_1d_tiled_f32, pipeline_im2col_1d_tiled_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
     vk_pipeline pipeline_timestep_embedding_f32;
     vk_pipeline pipeline_conv_transpose_1d_f32;
@@ -5125,6 +5126,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
     if (device->properties.limits.maxComputeWorkGroupInvocations >= 1024 &&
         device->properties.limits.maxComputeSharedMemorySize >= 49152) {
         ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_tiled_f32, "col2im_1d_tiled_f32", col2im_1d_tiled_f32_len, col2im_1d_tiled_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {1, 1, 1}, {}, 1);
+    }
+    // 512 threads and a 6144-float tile; devices below those limits keep the
+    // generic im2col pipeline for every shape.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+        device->properties.limits.maxComputeSharedMemorySize >= 6144 * 4) {
+        ggml_vk_create_pipeline(device, device->pipeline_im2col_1d_tiled_f32, "im2col_1d_tiled_f32", im2col_1d_tiled_f32_len, im2col_1d_tiled_f32_data, "main", 2, sizeof(vk_op_im2col_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_im2col_1d_tiled_f32_f16, "im2col_1d_tiled_f32_f16", im2col_1d_tiled_f32_f16_len, im2col_1d_tiled_f32_f16_data, "main", 2, sizeof(vk_op_im2col_push_constants), {1, 1, 1}, {}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -9979,6 +9987,45 @@ static bool ggml_vk_col2im_1d_use_tiled(const ggml_tensor * dst) {
     return (int64_t) ggml_nbytes(src0) + (int64_t) ggml_nbytes(dst) >= 32 * 1024 * 1024;
 }
 
+// Tiled 1D im2col tile geometry; keep in sync with vulkan-shaders/im2col_1d_tiled.comp.
+static constexpr uint32_t IM2COL_1D_TILE_OW     = 128;
+static constexpr uint32_t IM2COL_1D_TILE_IC     = 16;
+static constexpr uint32_t IM2COL_1D_SMEM_FLOATS = 6144;
+
+static bool ggml_vk_im2col_1d_use_tiled(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // kernel
+    const ggml_tensor * src1 = dst->src[1];  // signal
+    if (dst->op_params[6] == 1) {
+        return false;  // 2D
+    }
+    const int32_t s0 = dst->op_params[0];
+    const int32_t d0 = dst->op_params[4];
+    if (s0 <= 0 || d0 <= 0) {
+        return false;
+    }
+    const int64_t KW    = src0->ne[0];
+    const int64_t OW    = dst->ne[1];
+    const int64_t IC    = src1->ne[1];
+    const int64_t batch = src1->ne[2];
+    const int64_t win_w = (int64_t) (IM2COL_1D_TILE_OW - 1) * s0 + (KW - 1) * d0 + 1;
+    if ((int64_t) IM2COL_1D_TILE_IC * win_w > IM2COL_1D_SMEM_FLOATS) {
+        return false;
+    }
+    if (CEIL_DIV(OW, (int64_t) IM2COL_1D_TILE_OW) > 65535 ||
+        CEIL_DIV(IC, (int64_t) IM2COL_1D_TILE_IC) > 65535 || batch > 65535) {
+        return false;
+    }
+    // The tiled pipeline binds dst as a plain storage buffer (no BDA) and
+    // indexes it with 32-bit offsets.
+    if (ggml_nbytes(dst) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_nelements(dst) >= (int64_t) UINT32_MAX) {
+        return false;
+    }
+    // The generic pipeline wins while the SIGNAL stays cache-resident (its
+    // reads are the strided side); measured crossover on Strix Halo.
+    return ggml_nbytes(src1) >= 32 * 1024 * 1024;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10409,9 +10456,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_IM2COL:
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (ctx->device->pipeline_im2col_1d_tiled_f32 != nullptr && ggml_vk_im2col_1d_use_tiled(ctx, dst)) {
+                return ctx->device->pipeline_im2col_1d_tiled_f32;
+            }
             return ctx->device->pipeline_im2col_f32;
         }
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+            if (ctx->device->pipeline_im2col_1d_tiled_f32_f16 != nullptr && ggml_vk_im2col_1d_use_tiled(ctx, dst)) {
+                return ctx->device->pipeline_im2col_1d_tiled_f32_f16;
+            }
             return ctx->device->pipeline_im2col_f32_f16;
         }
         return nullptr;
@@ -10846,6 +10899,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
             const uint32_t batch = src1->ne[is_2D ? 3 : 2];
 
+            if (pipeline == ctx->device->pipeline_im2col_1d_tiled_f32 ||
+                pipeline == ctx->device->pipeline_im2col_1d_tiled_f32_f16) {
+                // One workgroup per TILE_OW x TILE_IC tile (im2col_1d_tiled.comp).
+                elements = { CEIL_DIV(OW, IM2COL_1D_TILE_OW), CEIL_DIV(IC, IM2COL_1D_TILE_IC), batch };
+                break;
+            }
             const uint32_t CHW = IC * KH * KW;
             // Cap X workgroups to limit concurrent IC channel reads.
             // The shader loops over X to cover the full CHW dimension.
@@ -11078,8 +11137,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, dst_buf, subbuf3 }, pc, elements);
     } else if (op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D) {
-        if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {
-            // buffer device address path doesn't use dst buffer
+        const bool tiled_1d = pipeline == ctx->device->pipeline_im2col_1d_tiled_f32 ||
+                              pipeline == ctx->device->pipeline_im2col_1d_tiled_f32_f16;
+        if (ctx->device->shader_int64 && ctx->device->buffer_device_address && !tiled_1d) {
+            // buffer device address path doesn't use dst buffer; the tiled 1D
+            // pipeline writes through the binding instead.
             dst_buf.size = 1;
         }
         // im2col uses only src1 and dst buffers

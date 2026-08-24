@@ -1045,6 +1045,8 @@ void process_shaders() {
     string_to_spv("snake_f32",           "snake.comp",           {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("col2im_1d_f32",       "col2im_1d.comp",       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("col2im_1d_tiled_f32", "col2im_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("im2col_1d_tiled_f32",     "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"BDA", "0"}});
+    string_to_spv("im2col_1d_tiled_f32_f16", "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"BDA", "0"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
