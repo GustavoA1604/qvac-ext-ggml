@@ -66,6 +66,32 @@ verified mechanisms.
 - SNAKE and COL2IM_1D have implementations on CPU, CUDA (inherited by HIP), Vulkan,
   Metal, OpenCL. No ACE-Step op participates in Vulkan fusion rules.
 
+## Strix Halo memory-access facts (measured, QVAC-24013)
+
+- Linear streaming (big elementwise ADD, 393 MB): ~208 GB/s. Small-segment
+  strided access collapses: 128-256 B segments at multi-KiB stride run at
+  2.6-22 GB/s — roughly 10-40x below linear streaming. Any kernel whose
+  per-workgroup global accesses are narrow strided segments is
+  pattern-bound, not bandwidth-bound, once data spills the ~32 MiB MALL.
+- Fixes that worked: LDS-staged tiles with contiguous slab loads
+  (col2im_1d_tiled.comp: 5-22 -> 88-146 GB/s; copy_transpose_large.comp:
+  2.6-5 -> 150-195 GB/s). Thread count matters as much as segment width
+  (256 -> 512 -> 1024 threads roughly doubled throughput twice).
+- prefer_host_memory ON vs OFF made NO difference to these patterns on Strix
+  (H3b measured); the Xclipse-motivated UMA default stays.
+- A slow kernel batched by test-backend-ops perf can exceed the ~10 s
+  watchdog and kill the GPU context ("context is lost... hard recovery") —
+  perf-harness artifact, distinguish from a real hang (R13).
+- Vulkan per-graph submit overhead: ~4.5 ms host per ~1100-node LM decode
+  graph (encode + fence) vs ~5.3 ms GPU compute; graph/gallocr REBUILD cost
+  is minor by comparison (LMGraphCache in the audiogen engine removed it;
+  wall barely moved). Command-buffer replay would be the next lever.
+- PRE-EXISTING switch-label hazard in ggml_vk_op_f32's elements switch:
+  splitting an op out of a shared case-label list silently reroutes the
+  remaining labels if the new case is appended at the list tail (cost: lost
+  element overrides, e.g. cpy_transpose tiles). Verify the intended branch
+  fires with a print after any such split.
+
 ## HIP/ROCm on this machine
 
 - ROCm 7.2 (HIP 7.2.53211) targets gfx1151 natively; 40 CUs. ggml-hip globs the
