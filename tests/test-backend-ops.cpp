@@ -8511,6 +8511,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_col2im_1d(4, 3, 10, 2, 1));
     test_cases.emplace_back(new test_col2im_1d(7, 1, 32, 4, 2));
     test_cases.emplace_back(new test_col2im_1d(3, 8, 16, 1, 0));
+    // Large outputs engage the Vulkan tiled shared-memory pipeline; cover
+    // ragged tails (T_out, OC not tile multiples) and k != 2*s0.
+    test_cases.emplace_back(new test_col2im_1d(8, 256, 1131, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(20, 1024, 189, 10, 5));
+    test_cases.emplace_back(new test_col2im_1d(4, 130, 1000, 2, 1));
+    test_cases.emplace_back(new test_col2im_1d(5, 96, 3000, 3, 1));
 
     test_cases.emplace_back(new test_snake(32, 8));
     test_cases.emplace_back(new test_snake(127, 3));
@@ -9477,6 +9483,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 8192, 1, 1}, {1, 1, 1, 1}));
 
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F16,  {512, 3072, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {8192, 512, 2, 1}, {0, 2, 1, 3}));
@@ -9513,6 +9520,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_conv_transpose_1d({2272, 256, 1, 1}, {11, 128, 256, 1}, 5, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({11360, 128, 1, 1}, {7, 64, 128, 1}, 3, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({34077, 18, 1, 1}, {16, 1, 18, 1}, 4, 0, 1));
+
+    // ACE-Step Oobleck VAE decoder col2im_1d shapes (one ~7.5 s decode window)
+    test_cases.emplace_back(new test_col2im_1d(20, 1024, 188, 10, 5));
+    test_cases.emplace_back(new test_col2im_1d(12, 512, 1880, 6, 3));
+    test_cases.emplace_back(new test_col2im_1d(8, 256, 11280, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(8, 128, 45120, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(4, 128, 180480, 2, 1));
 
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {512, 34, 2, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 1, 1}));

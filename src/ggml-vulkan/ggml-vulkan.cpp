@@ -881,6 +881,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_affine_prelu_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_col2im_1d_f32;
+    vk_pipeline pipeline_col2im_1d_tiled_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -5111,6 +5112,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32, "snake_f32", snake_f32_len, snake_f32_data, "main", 4, sizeof(vk_op_snake_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {512, 1, 1}, {}, 1);
+    // 1024 threads and 48 KiB of shared memory; devices below those limits keep
+    // the one-thread-per-output pipeline for every shape.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= 1024 &&
+        device->properties.limits.maxComputeSharedMemorySize >= 49152) {
+        ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_tiled_f32, "col2im_1d_tiled_f32", col2im_1d_tiled_f32_len, col2im_1d_tiled_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9930,6 +9937,35 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// Tiled col2im_1d tile geometry; keep in sync with vulkan-shaders/col2im_1d_tiled.comp.
+static constexpr uint32_t COL2IM_1D_TILE_T      = 64;
+static constexpr uint32_t COL2IM_1D_TILE_OC     = 64;
+static constexpr uint32_t COL2IM_1D_SMEM_FLOATS = 12288;
+
+static bool ggml_vk_col2im_1d_use_tiled(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
+    const int32_t OC = ggml_get_op_params_i32(dst, 1);
+    if (s0 <= 0 || OC <= 0) {
+        return false;
+    }
+    const int64_t K     = src0->ne[0] / OC;
+    const int64_t T_out = dst->ne[0];
+    // Upper bound on contributing input rows per tile (t_abs span / stride).
+    const int64_t n_tin = ((int64_t) COL2IM_1D_TILE_T + K - 1) / s0 + 1;
+    if (n_tin * COL2IM_1D_TILE_OC * K > COL2IM_1D_SMEM_FLOATS) {
+        return false;
+    }
+    if (CEIL_DIV(T_out, (int64_t) COL2IM_1D_TILE_T) > 65535 ||
+        CEIL_DIV((int64_t) OC, (int64_t) COL2IM_1D_TILE_OC) > 65535) {
+        return false;
+    }
+    // The one-thread-per-output pipeline wins while the columns stay
+    // cache-resident; the tiled pipeline wins once they spill to DRAM
+    // (measured on Strix Halo: 4.8-22 GB/s untiled vs 90-146 GB/s tiled).
+    return (int64_t) ggml_nbytes(src0) + (int64_t) ggml_nbytes(dst) >= 32 * 1024 * 1024;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10463,6 +10499,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_COL2IM_1D:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (ctx->device->pipeline_col2im_1d_tiled_f32 != nullptr && ggml_vk_col2im_1d_use_tiled(dst)) {
+                return ctx->device->pipeline_col2im_1d_tiled_f32;
+            }
             return ctx->device->pipeline_col2im_1d_f32;
         }
         return nullptr;
@@ -10885,11 +10924,26 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_UNARY:
     case GGML_OP_GLU:
     case GGML_OP_CONV_2D_DW:
+    case GGML_OP_COL2IM_1D:
+        if (pipeline == ctx->device->pipeline_col2im_1d_tiled_f32) {
+            const uint32_t OC = (uint32_t) ggml_get_op_params_i32(dst, 1);
+            elements = { (uint32_t) CEIL_DIV(dst->ne[0], COL2IM_1D_TILE_T),
+                         CEIL_DIV(OC, COL2IM_1D_TILE_OC), 1 };
+        } else {
+            const uint32_t ne = (uint32_t) ggml_nelements(dst);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
     case GGML_OP_ZERO_UPSAMPLE:
     case GGML_OP_CHANNEL_SHUFFLE:
     case GGML_OP_AFFINE_PRELU:
     case GGML_OP_SNAKE:
-    case GGML_OP_COL2IM_1D:
         {
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
