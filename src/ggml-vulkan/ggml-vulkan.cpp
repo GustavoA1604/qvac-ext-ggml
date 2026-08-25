@@ -1589,6 +1589,7 @@ struct vk_op_im2col_3d_push_constants {
     uint32_t OH_OW_IC_KD_KH_KW;
     uint32_t OW_IC_KD_KH_KW;
     uint32_t misalign_offsets;
+    uint32_t OW;
 };
 
 struct vk_op_timestep_embedding_push_constants {
@@ -12891,6 +12892,7 @@ static void ggml_vk_im2col_3d(ggml_backend_vk_context * ctx, vk_context& subctx,
     pc.OD_OH_OW_IC_KD_KH_KW = OD*OH*OW*IC*KD*KH*KW;
     pc.OH_OW_IC_KD_KH_KW = OH*OW*IC*KD*KH*KW;
     pc.OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
+    pc.OW = OW;
 
     ggml_vk_op_f32<vk_op_im2col_3d_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_IM2COL_3D, std::move(pc));
 }
