@@ -607,6 +607,27 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
     { 4, 0, 3 }, // set_rows->src[0] == view
 };
 
+// Tile geometry for the tiled 1D pipelines; keep each group in sync with the
+// matching vulkan-shaders/*.comp defines.
+static constexpr uint32_t COL2IM_1D_TILE_T       = 64;
+static constexpr uint32_t COL2IM_1D_TILE_OC      = 64;
+static constexpr uint32_t COL2IM_1D_TILE_THREADS = 1024;
+static constexpr uint32_t COL2IM_1D_SMEM_FLOATS  = 12288;
+
+static constexpr uint32_t IM2COL_1D_TILE_OW      = 128;
+static constexpr uint32_t IM2COL_1D_TILE_IC      = 16;
+static constexpr uint32_t IM2COL_1D_TILE_THREADS = 512;
+static constexpr uint32_t IM2COL_1D_SMEM_FLOATS  = 6144;
+
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I00  = 64;
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I01  = 128;
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_THREADS   = 512;
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_SMEM_BYTES =
+    CPY_TRANSPOSE_LARGE_TILE_I00 * (CPY_TRANSPOSE_LARGE_TILE_I01 + 1) * 4;
+
+// Measured cache-spill crossover: the tiled pipelines win once the tensors
+// leave the last-level cache.
+static constexpr uint64_t TILED_PIPELINE_MIN_BYTES = 32ull * 1024 * 1024;
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -783,6 +804,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_quant_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
+    vk_pipeline pipeline_cpy_transpose_large_16, pipeline_cpy_transpose_large_32;
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
@@ -863,6 +885,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_count_equal_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+    vk_pipeline pipeline_im2col_1d_tiled_f32, pipeline_im2col_1d_tiled_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
     vk_pipeline pipeline_timestep_embedding_f32;
     vk_pipeline pipeline_conv_transpose_1d_f32;
@@ -881,6 +904,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_affine_prelu_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_col2im_1d_f32;
+    vk_pipeline pipeline_col2im_1d_tiled_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1565,6 +1589,7 @@ struct vk_op_im2col_3d_push_constants {
     uint32_t OH_OW_IC_KD_KH_KW;
     uint32_t OW_IC_KD_KH_KW;
     uint32_t misalign_offsets;
+    uint32_t OW;
 };
 
 struct vk_op_timestep_embedding_push_constants {
@@ -4772,6 +4797,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_32, "cpy_transpose_32", cpy_transpose_32_len, cpy_transpose_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_16, "cpy_transpose_16", cpy_transpose_16_len, cpy_transpose_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    // Devices below the tile's thread or shared-memory needs keep the 32x32
+    // pipeline for every size.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= CPY_TRANSPOSE_LARGE_THREADS &&
+        device->properties.limits.maxComputeSharedMemorySize >= CPY_TRANSPOSE_LARGE_SMEM_BYTES) {
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_large_32, "cpy_transpose_large_32", cpy_transpose_large_32_len, cpy_transpose_large_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_large_16, "cpy_transpose_large_16", cpy_transpose_large_16_len, cpy_transpose_large_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q1_0], "cpy_f32_q1_0", cpy_f32_q1_0_len, cpy_f32_q1_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_Q4_0], "cpy_f32_q4_0", cpy_f32_q4_0_len, cpy_f32_q4_0_data, "main", 2, sizeof(vk_op_unary_push_constants), {32, 1, 1}, {}, 1);
@@ -5111,6 +5143,19 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32, "snake_f32", snake_f32_len, snake_f32_data, "main", 4, sizeof(vk_op_snake_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {512, 1, 1}, {}, 1);
+    // Devices below the tile's thread or shared-memory needs keep the
+    // one-thread-per-output pipeline for every shape.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= COL2IM_1D_TILE_THREADS &&
+        device->properties.limits.maxComputeSharedMemorySize >= COL2IM_1D_SMEM_FLOATS * 4) {
+        ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_tiled_f32, "col2im_1d_tiled_f32", col2im_1d_tiled_f32_len, col2im_1d_tiled_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {1, 1, 1}, {}, 1);
+    }
+    // Devices below the tile's thread or shared-memory needs keep the generic
+    // im2col pipeline for every shape.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= IM2COL_1D_TILE_THREADS &&
+        device->properties.limits.maxComputeSharedMemorySize >= IM2COL_1D_SMEM_FLOATS * 4) {
+        ggml_vk_create_pipeline(device, device->pipeline_im2col_1d_tiled_f32, "im2col_1d_tiled_f32", im2col_1d_tiled_f32_len, im2col_1d_tiled_f32_data, "main", 2, sizeof(vk_op_im2col_push_constants), {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_im2col_1d_tiled_f32_f16, "im2col_1d_tiled_f32_f16", im2col_1d_tiled_f32_f16_len, im2col_1d_tiled_f32_f16_data, "main", 2, sizeof(vk_op_im2col_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -7904,10 +7949,14 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
     bool transpose = dst && src->nb[1] == ggml_type_size(to) && ggml_are_same_shape(dst, src);
 
     if (transpose && src->type == to) {
+        // Past the last-level-cache scale, the large tile's wider contiguous
+        // segments beat the 32x32 tile by ~10x on strided reads (Strix Halo).
+        const bool large = ggml_nbytes(src) >= TILED_PIPELINE_MIN_BYTES &&
+                           ctx->device->pipeline_cpy_transpose_large_32 != nullptr;
         if (ggml_type_size(to) == 4) {
-            return ctx->device->pipeline_cpy_transpose_32;
+            return large ? ctx->device->pipeline_cpy_transpose_large_32 : ctx->device->pipeline_cpy_transpose_32;
         } else if (ggml_type_size(to) == 2) {
-            return ctx->device->pipeline_cpy_transpose_16;
+            return large ? ctx->device->pipeline_cpy_transpose_large_16 : ctx->device->pipeline_cpy_transpose_16;
         }
     }
 
@@ -9930,6 +9979,66 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+static bool ggml_vk_col2im_1d_use_tiled(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
+    const int32_t OC = ggml_get_op_params_i32(dst, 1);
+    if (s0 <= 0 || OC <= 0) {
+        return false;
+    }
+    const int64_t K     = src0->ne[0] / OC;
+    const int64_t T_out = dst->ne[0];
+    // Upper bound on contributing input rows per tile (t_abs span / stride).
+    const int64_t n_tin = ((int64_t) COL2IM_1D_TILE_T + K - 1) / s0 + 1;
+    if (n_tin * COL2IM_1D_TILE_OC * K > COL2IM_1D_SMEM_FLOATS) {
+        return false;
+    }
+    const auto & limits = ctx->device->properties.limits;
+    if (CEIL_DIV(T_out, (int64_t) COL2IM_1D_TILE_T) > limits.maxComputeWorkGroupCount[0] ||
+        CEIL_DIV((int64_t) OC, (int64_t) COL2IM_1D_TILE_OC) > limits.maxComputeWorkGroupCount[1]) {
+        return false;
+    }
+    // The untiled pipeline wins while the columns stay cache-resident; the
+    // tiled one wins once they spill to DRAM (measured crossover, Strix Halo).
+    return ggml_nbytes(src0) + ggml_nbytes(dst) >= TILED_PIPELINE_MIN_BYTES;
+}
+
+static bool ggml_vk_im2col_1d_use_tiled(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // kernel
+    const ggml_tensor * src1 = dst->src[1];  // signal
+    if (dst->op_params[6] == 1) {
+        return false;  // 2D
+    }
+    const int32_t s0 = dst->op_params[0];
+    const int32_t d0 = dst->op_params[4];
+    if (s0 <= 0 || d0 <= 0) {
+        return false;
+    }
+    const int64_t KW    = src0->ne[0];
+    const int64_t OW    = dst->ne[1];
+    const int64_t IC    = src1->ne[1];
+    const int64_t batch = src1->ne[2];
+    const int64_t win_w = (int64_t) (IM2COL_1D_TILE_OW - 1) * s0 + (KW - 1) * d0 + 1;
+    if ((int64_t) IM2COL_1D_TILE_IC * win_w > IM2COL_1D_SMEM_FLOATS) {
+        return false;
+    }
+    const auto & limits = ctx->device->properties.limits;
+    if (CEIL_DIV(OW, (int64_t) IM2COL_1D_TILE_OW) > limits.maxComputeWorkGroupCount[0] ||
+        CEIL_DIV(IC, (int64_t) IM2COL_1D_TILE_IC) > limits.maxComputeWorkGroupCount[1] ||
+        batch > limits.maxComputeWorkGroupCount[2]) {
+        return false;
+    }
+    // The tiled pipeline binds dst as a plain storage buffer (no BDA) and
+    // indexes it with 32-bit offsets.
+    if (ggml_nbytes(dst) > limits.maxStorageBufferRange ||
+        ggml_nelements(dst) >= (int64_t) UINT32_MAX) {
+        return false;
+    }
+    // The generic pipeline wins while the SIGNAL stays cache-resident (its
+    // reads are the strided side); measured crossover on Strix Halo.
+    return ggml_nbytes(src1) >= TILED_PIPELINE_MIN_BYTES;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10360,9 +10469,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_IM2COL:
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (ctx->device->pipeline_im2col_1d_tiled_f32 != nullptr && ggml_vk_im2col_1d_use_tiled(ctx, dst)) {
+                return ctx->device->pipeline_im2col_1d_tiled_f32;
+            }
             return ctx->device->pipeline_im2col_f32;
         }
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+            if (ctx->device->pipeline_im2col_1d_tiled_f32_f16 != nullptr && ggml_vk_im2col_1d_use_tiled(ctx, dst)) {
+                return ctx->device->pipeline_im2col_1d_tiled_f32_f16;
+            }
             return ctx->device->pipeline_im2col_f32_f16;
         }
         return nullptr;
@@ -10463,6 +10578,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_COL2IM_1D:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (ctx->device->pipeline_col2im_1d_tiled_f32 != nullptr && ggml_vk_col2im_1d_use_tiled(ctx, dst)) {
+                return ctx->device->pipeline_col2im_1d_tiled_f32;
+            }
             return ctx->device->pipeline_col2im_1d_f32;
         }
         return nullptr;
@@ -10794,6 +10912,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
             const uint32_t batch = src1->ne[is_2D ? 3 : 2];
 
+            if (pipeline == ctx->device->pipeline_im2col_1d_tiled_f32 ||
+                pipeline == ctx->device->pipeline_im2col_1d_tiled_f32_f16) {
+                // One workgroup per TILE_OW x TILE_IC tile (im2col_1d_tiled.comp).
+                elements = { CEIL_DIV(OW, IM2COL_1D_TILE_OW), CEIL_DIV(IC, IM2COL_1D_TILE_IC), batch };
+                break;
+            }
             const uint32_t CHW = IC * KH * KW;
             // Cap X workgroups to limit concurrent IC channel reads.
             // The shader loops over X to cover the full CHW dimension.
@@ -10889,7 +11013,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_CHANNEL_SHUFFLE:
     case GGML_OP_AFFINE_PRELU:
     case GGML_OP_SNAKE:
-    case GGML_OP_COL2IM_1D:
         {
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
@@ -10915,7 +11038,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { ne, 1, 1 };
             }
 
-            if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
+            if (pipeline == ctx->device->pipeline_cpy_transpose_large_32 ||
+                pipeline == ctx->device->pipeline_cpy_transpose_large_16) {
+                // copy_transpose_large.comp tiles
+                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], CPY_TRANSPOSE_LARGE_TILE_I00);
+                elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], CPY_TRANSPOSE_LARGE_TILE_I01);
+                elements[2] = (uint32_t)(dst->ne[2]*dst->ne[3]);
+                elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+                elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+                elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+            } else if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
                 pipeline == ctx->device->pipeline_cpy_transpose_16) {
                 // 32x32 tiles
                 elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
@@ -10934,6 +11066,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements[2] = 1;
             }
         } break;
+    case GGML_OP_COL2IM_1D:
+        if (pipeline == ctx->device->pipeline_col2im_1d_tiled_f32) {
+            const uint32_t OC = (uint32_t) ggml_get_op_params_i32(dst, 1);
+            elements = { (uint32_t) CEIL_DIV(dst->ne[0], COL2IM_1D_TILE_T),
+                         CEIL_DIV(OC, COL2IM_1D_TILE_OC), 1 };
+        } else {
+            const uint32_t ne = (uint32_t) ggml_nelements(dst);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
     case GGML_OP_ADD_ID:
         {
             elements = { (uint32_t)ne01, (uint32_t)ne02, 1 };
@@ -11002,8 +11150,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, dst_buf, subbuf3 }, pc, elements);
     } else if (op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D) {
-        if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {
-            // buffer device address path doesn't use dst buffer
+        const bool tiled_1d = pipeline == ctx->device->pipeline_im2col_1d_tiled_f32 ||
+                              pipeline == ctx->device->pipeline_im2col_1d_tiled_f32_f16;
+        if (ctx->device->shader_int64 && ctx->device->buffer_device_address && !tiled_1d) {
+            // buffer device address path doesn't use dst buffer; the tiled 1D
+            // pipeline writes through the binding instead.
             dst_buf.size = 1;
         }
         // im2col uses only src1 and dst buffers
@@ -12741,6 +12892,7 @@ static void ggml_vk_im2col_3d(ggml_backend_vk_context * ctx, vk_context& subctx,
     pc.OD_OH_OW_IC_KD_KH_KW = OD*OH*OW*IC*KD*KH*KW;
     pc.OH_OW_IC_KD_KH_KW = OH*OW*IC*KD*KH*KW;
     pc.OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
+    pc.OW = OW;
 
     ggml_vk_op_f32<vk_op_im2col_3d_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_IM2COL_3D, std::move(pc));
 }

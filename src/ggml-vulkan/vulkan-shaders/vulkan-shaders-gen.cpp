@@ -763,6 +763,8 @@ void process_shaders() {
 
     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("cpy_transpose_large_16", "copy_transpose_large.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+    string_to_spv("cpy_transpose_large_32", "copy_transpose_large.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
     for (std::string t : {"q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
@@ -1042,6 +1044,9 @@ void process_shaders() {
     string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
     string_to_spv("snake_f32",           "snake.comp",           {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("col2im_1d_f32",       "col2im_1d.comp",       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("col2im_1d_tiled_f32", "col2im_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("im2col_1d_tiled_f32",     "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"BDA", "0"}});
+    string_to_spv("im2col_1d_tiled_f32_f16", "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"BDA", "0"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

@@ -8007,6 +8007,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // tensor small while still driving OW well past the bound.
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {70000, 1, 1, 1}, {3, 1, 1, 1}, 1, 0, 0, 0, 1, 0, false));
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {70000, 1, 1, 1}, {3, 1, 1, 1}, 1, 0, 1, 0, 1, 0, false));
+    // >=32 MiB 1D columns engage the Vulkan tiled im2col pipeline; ragged
+    // OW/IC and dilation cover the tile-boundary and window checks.
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {90001, 130, 1, 1}, {7, 130, 8, 1}, 1, 0, 9, 0, 3, 0, false));
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {70001, 129, 1, 1}, {1, 129, 8, 1}, 1, 0, 0, 0, 1, 0, false));
 
     // im2col 3D
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
@@ -8296,6 +8300,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
+    // >=32 MiB transposes engage the Vulkan large-tile copy pipeline; ragged
+    // dims cover the tile-boundary checks.
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {65537, 130, 1, 1}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {131073, 130, 1, 1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {1, 0, 2, 3}));
@@ -8511,6 +8519,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_col2im_1d(4, 3, 10, 2, 1));
     test_cases.emplace_back(new test_col2im_1d(7, 1, 32, 4, 2));
     test_cases.emplace_back(new test_col2im_1d(3, 8, 16, 1, 0));
+    // Mid-size shapes stay on the untiled Vulkan pipeline (below the byte gate).
+    test_cases.emplace_back(new test_col2im_1d(8, 256, 1131, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(20, 1024, 189, 10, 5));
+    test_cases.emplace_back(new test_col2im_1d(4, 130, 1000, 2, 1));
+    test_cases.emplace_back(new test_col2im_1d(5, 96, 3000, 3, 1));
+    // Columns + signal past 32 MiB engage the Vulkan tiled shared-memory
+    // pipeline; cover ragged tails (T_out, OC not tile multiples) and k != 2*s0.
+    test_cases.emplace_back(new test_col2im_1d(8, 256, 4000, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(4, 130, 18000, 2, 1));
+    test_cases.emplace_back(new test_col2im_1d(5, 96, 24000, 3, 1));
 
     test_cases.emplace_back(new test_snake(32, 8));
     test_cases.emplace_back(new test_snake(127, 3));
@@ -9477,6 +9495,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 8192, 1, 1}, {1, 1, 1, 1}));
 
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F16,  {512, 3072, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {8192, 512, 2, 1}, {0, 2, 1, 3}));
@@ -9484,6 +9503,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_Q4_0, {8192, 512, 2, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32,  {8192, 512, 2, 1}));
 
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {180480, 128, 1, 1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {768*1024, 256, 1, 1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768*1024, 256, 1, 1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {1, 0, 2, 3}, {0, 0, 0, 0}));
@@ -9513,6 +9533,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_conv_transpose_1d({2272, 256, 1, 1}, {11, 128, 256, 1}, 5, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({11360, 128, 1, 1}, {7, 64, 128, 1}, 3, 0, 1));
     test_cases.emplace_back(new test_conv_transpose_1d({34077, 18, 1, 1}, {16, 1, 18, 1}, 4, 0, 1));
+
+    // ACE-Step Oobleck VAE decoder conv1d im2col shapes (one ~7.5 s decode window)
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {11280, 512, 1, 1}, {7, 512, 512, 1}, 1, 0, 3, 0, 1, 0, false));
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {45120, 256, 1, 1}, {7, 256, 256, 1}, 1, 0, 3, 0, 1, 0, false));
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {180480, 128, 1, 1}, {7, 128, 128, 1}, 1, 0, 9, 0, 3, 0, false));
+    test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {180480, 128, 1, 1}, {1, 128, 128, 1}, 1, 0, 0, 0, 1, 0, false));
+
+    // ACE-Step Oobleck VAE decoder col2im_1d shapes (one ~7.5 s decode window)
+    test_cases.emplace_back(new test_col2im_1d(20, 1024, 188, 10, 5));
+    test_cases.emplace_back(new test_col2im_1d(12, 512, 1880, 6, 3));
+    test_cases.emplace_back(new test_col2im_1d(8, 256, 11280, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(8, 128, 45120, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(4, 128, 180480, 2, 1));
 
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {512, 34, 2, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 1, 1}));

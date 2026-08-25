@@ -37,6 +37,7 @@ layout (push_constant) uniform parameter
     uint32_t OH_OW_IC_KD_KH_KW;
     uint32_t OW_IC_KD_KH_KW;
     uint32_t misalign_offsets;
+    uint32_t OW;
 } p;
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }
@@ -83,6 +84,7 @@ void main() {
     uint32_t OD_OH_OW_IC_KD_KH_KW = p.OD_OH_OW_IC_KD_KH_KW;
     uint32_t OH_OW_IC_KD_KH_KW = p.OH_OW_IC_KD_KH_KW;
     uint32_t OW_IC_KD_KH_KW = p.OW_IC_KD_KH_KW;
+    uint32_t OW = p.OW;
 
     if (i >= IC_KD_KH_KW) {
         return;
@@ -93,7 +95,6 @@ void main() {
     const uint32_t ikh = (i - iic * KD_KH_KW - ikd * KH_KW) / KW;
     const uint32_t ikw = i % KW;
 
-    const uint32_t OW = OW_IC_KD_KH_KW / IC_KD_KH_KW;
     uint32_t iow = gl_GlobalInvocationID.y;
     while (iow < OW) {
         for (uint32_t iz = gl_GlobalInvocationID.z; iz < N_OD_OH; iz += gl_NumWorkGroups.z) {
