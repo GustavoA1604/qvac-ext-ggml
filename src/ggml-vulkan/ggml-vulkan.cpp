@@ -10822,6 +10822,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             const uint32_t N_OD_OH = N*OD*OH;
 
             elements = { IC_KD_KH_KW, OW, N_OD_OH };
+            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
             elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
         } break;
     case GGML_OP_TIMESTEP_EMBEDDING:
