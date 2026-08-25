@@ -8519,12 +8519,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_col2im_1d(4, 3, 10, 2, 1));
     test_cases.emplace_back(new test_col2im_1d(7, 1, 32, 4, 2));
     test_cases.emplace_back(new test_col2im_1d(3, 8, 16, 1, 0));
-    // Large outputs engage the Vulkan tiled shared-memory pipeline; cover
-    // ragged tails (T_out, OC not tile multiples) and k != 2*s0.
+    // Mid-size shapes stay on the untiled Vulkan pipeline (below the byte gate).
     test_cases.emplace_back(new test_col2im_1d(8, 256, 1131, 4, 2));
     test_cases.emplace_back(new test_col2im_1d(20, 1024, 189, 10, 5));
     test_cases.emplace_back(new test_col2im_1d(4, 130, 1000, 2, 1));
     test_cases.emplace_back(new test_col2im_1d(5, 96, 3000, 3, 1));
+    // Columns + signal past 32 MiB engage the Vulkan tiled shared-memory
+    // pipeline; cover ragged tails (T_out, OC not tile multiples) and k != 2*s0.
+    test_cases.emplace_back(new test_col2im_1d(8, 256, 4000, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(4, 130, 18000, 2, 1));
+    test_cases.emplace_back(new test_col2im_1d(5, 96, 24000, 3, 1));
 
     test_cases.emplace_back(new test_snake(32, 8));
     test_cases.emplace_back(new test_snake(127, 3));

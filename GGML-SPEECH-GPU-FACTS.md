@@ -8,15 +8,17 @@ verified mechanisms.
 ## Engine dispatch (qvac-ext-lib-whisper.cpp/engines/audiogen)
 
 - All AceSTEP stages run DIRECT `ggml_backend_graph_compute` on one backend
-  (dit_ggml.cpp:743, lm_ggml.cpp:446/590, textenc_ggml.cpp:186, cond_ggml.cpp:353,
-  detok_ggml.cpp:222). `supports_op` is consulted only by the flash-attention probe
-  (dit_ggml.cpp:305-344) and by the VAE scheduler ([GPU,CPU], op_offload=false,
-  vae_ggml.cpp:388-421) which exists for progress/cancel callbacks. Scheduler-based
-  fallback reasoning applies ONLY to the VAE stage.
-- Stage placement is an allowlist (stage_placement.h:76-95): under Vulkan the LM
-  runs on CPU (Mali-G715 observation), detok/DiT/VAE/encoders on GPU. ROCm/MUSA are
-  not validated backends (backend_registry.h:63-70); unit tests pin these exclusions
-  (test_acestep_units.cpp:316-319, :380-381).
+  (dit_ggml.cpp, lm_ggml.cpp, textenc_ggml.cpp, cond_ggml.cpp, detok_ggml.cpp).
+  `supports_op` is consulted only by the flash-attention probe (dit_ggml.cpp)
+  and by the VAE scheduler ([GPU,CPU], op_offload=false, vae_ggml.cpp) which
+  exists for progress/cancel callbacks. Scheduler-based fallback reasoning
+  applies ONLY to the VAE stage.
+- Stage placement is an allowlist (stage_placement.h resolve_stage_placement):
+  detok/DiT/VAE/encoders run on the GPU; the LM runs on the GPU on Metal, OpenCL,
+  and per-device on Vulkan (Mesa RADV devices, validated on Strix Halo against the
+  F32-dequant reference), and on the CPU on every other Vulkan device (Mali-G715
+  collapse observation) and on CUDA. ROCm/MUSA are not validated backends
+  (backend_registry.h); unit tests pin these rules (test_acestep_units.cpp).
 - Default memory mode loads and frees stage weights per generation
   (engine.cpp:1114); ACESTEP_KEEP_STAGES=1 keeps them resident.
 
@@ -81,7 +83,8 @@ verified mechanisms.
   (H3b measured); the Xclipse-motivated UMA default stays.
 - A slow kernel batched by test-backend-ops perf can exceed the ~10 s
   watchdog and kill the GPU context ("context is lost... hard recovery") —
-  perf-harness artifact, distinguish from a real hang (R13).
+  a perf-harness artifact; distinguish it from a real hang before concluding
+  anything from such a run.
 - Vulkan per-graph submit overhead: ~4.5 ms host per ~1100-node LM decode
   graph (encode + fence) vs ~5.3 ms GPU compute; graph/gallocr REBUILD cost
   is minor by comparison (LMGraphCache in the audiogen engine removed it;

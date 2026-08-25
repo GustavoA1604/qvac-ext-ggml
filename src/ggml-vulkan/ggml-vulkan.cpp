@@ -607,6 +607,27 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
     { 4, 0, 3 }, // set_rows->src[0] == view
 };
 
+// Tile geometry for the tiled 1D pipelines; keep each group in sync with the
+// matching vulkan-shaders/*.comp defines.
+static constexpr uint32_t COL2IM_1D_TILE_T       = 64;
+static constexpr uint32_t COL2IM_1D_TILE_OC      = 64;
+static constexpr uint32_t COL2IM_1D_TILE_THREADS = 1024;
+static constexpr uint32_t COL2IM_1D_SMEM_FLOATS  = 12288;
+
+static constexpr uint32_t IM2COL_1D_TILE_OW      = 128;
+static constexpr uint32_t IM2COL_1D_TILE_IC      = 16;
+static constexpr uint32_t IM2COL_1D_TILE_THREADS = 512;
+static constexpr uint32_t IM2COL_1D_SMEM_FLOATS  = 6144;
+
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I00  = 64;
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I01  = 128;
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_THREADS   = 512;
+static constexpr uint32_t CPY_TRANSPOSE_LARGE_SMEM_BYTES =
+    CPY_TRANSPOSE_LARGE_TILE_I00 * (CPY_TRANSPOSE_LARGE_TILE_I01 + 1) * 4;
+
+// Measured cache-spill crossover: the tiled pipelines win once the tensors
+// leave the last-level cache.
+static constexpr uint64_t TILED_PIPELINE_MIN_BYTES = 32ull * 1024 * 1024;
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -4775,10 +4796,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_32, "cpy_transpose_32", cpy_transpose_32_len, cpy_transpose_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_16, "cpy_transpose_16", cpy_transpose_16_len, cpy_transpose_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
-    // 512 threads and a 64x129-uint tile; devices below those limits keep the
-    // 32x32 pipeline for every size.
-    if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
-        device->properties.limits.maxComputeSharedMemorySize >= 64 * 129 * 4) {
+    // Devices below the tile's thread or shared-memory needs keep the 32x32
+    // pipeline for every size.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= CPY_TRANSPOSE_LARGE_THREADS &&
+        device->properties.limits.maxComputeSharedMemorySize >= CPY_TRANSPOSE_LARGE_SMEM_BYTES) {
         ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_large_32, "cpy_transpose_large_32", cpy_transpose_large_32_len, cpy_transpose_large_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_cpy_transpose_large_16, "cpy_transpose_large_16", cpy_transpose_large_16_len, cpy_transpose_large_16_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     }
@@ -5121,16 +5142,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32, "snake_f32", snake_f32_len, snake_f32_data, "main", 4, sizeof(vk_op_snake_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {512, 1, 1}, {}, 1);
-    // 1024 threads and 48 KiB of shared memory; devices below those limits keep
-    // the one-thread-per-output pipeline for every shape.
-    if (device->properties.limits.maxComputeWorkGroupInvocations >= 1024 &&
-        device->properties.limits.maxComputeSharedMemorySize >= 49152) {
+    // Devices below the tile's thread or shared-memory needs keep the
+    // one-thread-per-output pipeline for every shape.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= COL2IM_1D_TILE_THREADS &&
+        device->properties.limits.maxComputeSharedMemorySize >= COL2IM_1D_SMEM_FLOATS * 4) {
         ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_tiled_f32, "col2im_1d_tiled_f32", col2im_1d_tiled_f32_len, col2im_1d_tiled_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {1, 1, 1}, {}, 1);
     }
-    // 512 threads and a 6144-float tile; devices below those limits keep the
-    // generic im2col pipeline for every shape.
-    if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
-        device->properties.limits.maxComputeSharedMemorySize >= 6144 * 4) {
+    // Devices below the tile's thread or shared-memory needs keep the generic
+    // im2col pipeline for every shape.
+    if (device->properties.limits.maxComputeWorkGroupInvocations >= IM2COL_1D_TILE_THREADS &&
+        device->properties.limits.maxComputeSharedMemorySize >= IM2COL_1D_SMEM_FLOATS * 4) {
         ggml_vk_create_pipeline(device, device->pipeline_im2col_1d_tiled_f32, "im2col_1d_tiled_f32", im2col_1d_tiled_f32_len, im2col_1d_tiled_f32_data, "main", 2, sizeof(vk_op_im2col_push_constants), {1, 1, 1}, {}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_im2col_1d_tiled_f32_f16, "im2col_1d_tiled_f32_f16", im2col_1d_tiled_f32_f16_len, im2col_1d_tiled_f32_f16_data, "main", 2, sizeof(vk_op_im2col_push_constants), {1, 1, 1}, {}, 1);
     }
@@ -7929,7 +7950,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
     if (transpose && src->type == to) {
         // Past the last-level-cache scale, the large tile's wider contiguous
         // segments beat the 32x32 tile by ~10x on strided reads (Strix Halo).
-        const bool large = ggml_nbytes(src) >= 32 * 1024 * 1024 &&
+        const bool large = ggml_nbytes(src) >= TILED_PIPELINE_MIN_BYTES &&
                            ctx->device->pipeline_cpy_transpose_large_32 != nullptr;
         if (ggml_type_size(to) == 4) {
             return large ? ctx->device->pipeline_cpy_transpose_large_32 : ctx->device->pipeline_cpy_transpose_32;
@@ -9957,12 +9978,7 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
-// Tiled col2im_1d tile geometry; keep in sync with vulkan-shaders/col2im_1d_tiled.comp.
-static constexpr uint32_t COL2IM_1D_TILE_T      = 64;
-static constexpr uint32_t COL2IM_1D_TILE_OC     = 64;
-static constexpr uint32_t COL2IM_1D_SMEM_FLOATS = 12288;
-
-static bool ggml_vk_col2im_1d_use_tiled(const ggml_tensor * dst) {
+static bool ggml_vk_col2im_1d_use_tiled(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const int32_t s0 = ggml_get_op_params_i32(dst, 0);
     const int32_t OC = ggml_get_op_params_i32(dst, 1);
@@ -9976,19 +9992,15 @@ static bool ggml_vk_col2im_1d_use_tiled(const ggml_tensor * dst) {
     if (n_tin * COL2IM_1D_TILE_OC * K > COL2IM_1D_SMEM_FLOATS) {
         return false;
     }
-    if (CEIL_DIV(T_out, (int64_t) COL2IM_1D_TILE_T) > 65535 ||
-        CEIL_DIV((int64_t) OC, (int64_t) COL2IM_1D_TILE_OC) > 65535) {
+    const auto & limits = ctx->device->properties.limits;
+    if (CEIL_DIV(T_out, (int64_t) COL2IM_1D_TILE_T) > limits.maxComputeWorkGroupCount[0] ||
+        CEIL_DIV((int64_t) OC, (int64_t) COL2IM_1D_TILE_OC) > limits.maxComputeWorkGroupCount[1]) {
         return false;
     }
     // The untiled pipeline wins while the columns stay cache-resident; the
     // tiled one wins once they spill to DRAM (measured crossover, Strix Halo).
-    return (int64_t) ggml_nbytes(src0) + (int64_t) ggml_nbytes(dst) >= 32 * 1024 * 1024;
+    return ggml_nbytes(src0) + ggml_nbytes(dst) >= TILED_PIPELINE_MIN_BYTES;
 }
-
-// Tiled 1D im2col tile geometry; keep in sync with vulkan-shaders/im2col_1d_tiled.comp.
-static constexpr uint32_t IM2COL_1D_TILE_OW     = 128;
-static constexpr uint32_t IM2COL_1D_TILE_IC     = 16;
-static constexpr uint32_t IM2COL_1D_SMEM_FLOATS = 6144;
 
 static bool ggml_vk_im2col_1d_use_tiled(ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // kernel
@@ -10009,19 +10021,21 @@ static bool ggml_vk_im2col_1d_use_tiled(ggml_backend_vk_context * ctx, const ggm
     if ((int64_t) IM2COL_1D_TILE_IC * win_w > IM2COL_1D_SMEM_FLOATS) {
         return false;
     }
-    if (CEIL_DIV(OW, (int64_t) IM2COL_1D_TILE_OW) > 65535 ||
-        CEIL_DIV(IC, (int64_t) IM2COL_1D_TILE_IC) > 65535 || batch > 65535) {
+    const auto & limits = ctx->device->properties.limits;
+    if (CEIL_DIV(OW, (int64_t) IM2COL_1D_TILE_OW) > limits.maxComputeWorkGroupCount[0] ||
+        CEIL_DIV(IC, (int64_t) IM2COL_1D_TILE_IC) > limits.maxComputeWorkGroupCount[1] ||
+        batch > limits.maxComputeWorkGroupCount[2]) {
         return false;
     }
     // The tiled pipeline binds dst as a plain storage buffer (no BDA) and
     // indexes it with 32-bit offsets.
-    if (ggml_nbytes(dst) > ctx->device->properties.limits.maxStorageBufferRange ||
+    if (ggml_nbytes(dst) > limits.maxStorageBufferRange ||
         ggml_nelements(dst) >= (int64_t) UINT32_MAX) {
         return false;
     }
     // The generic pipeline wins while the SIGNAL stays cache-resident (its
     // reads are the strided side); measured crossover on Strix Halo.
-    return ggml_nbytes(src1) >= 32 * 1024 * 1024;
+    return ggml_nbytes(src1) >= TILED_PIPELINE_MIN_BYTES;
 }
 
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
@@ -10563,7 +10577,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_COL2IM_1D:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            if (ctx->device->pipeline_col2im_1d_tiled_f32 != nullptr && ggml_vk_col2im_1d_use_tiled(dst)) {
+            if (ctx->device->pipeline_col2im_1d_tiled_f32 != nullptr && ggml_vk_col2im_1d_use_tiled(ctx, dst)) {
                 return ctx->device->pipeline_col2im_1d_tiled_f32;
             }
             return ctx->device->pipeline_col2im_1d_f32;
@@ -11025,9 +11039,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
             if (pipeline == ctx->device->pipeline_cpy_transpose_large_32 ||
                 pipeline == ctx->device->pipeline_cpy_transpose_large_16) {
-                // 64x128 tiles (copy_transpose_large.comp)
-                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 64);
-                elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 128);
+                // copy_transpose_large.comp tiles
+                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], CPY_TRANSPOSE_LARGE_TILE_I00);
+                elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], CPY_TRANSPOSE_LARGE_TILE_I01);
                 elements[2] = (uint32_t)(dst->ne[2]*dst->ne[3]);
                 elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
                 elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
