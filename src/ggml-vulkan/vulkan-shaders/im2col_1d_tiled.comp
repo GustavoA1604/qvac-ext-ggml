@@ -4,16 +4,8 @@
 
 #include "types.glsl"
 
-// Tiled 1D im2col: same indexing as im2col.comp with KH == OH == 1, but each
-// workgroup stages the contiguous input window for a TILE_OW x TILE_IC output
-// tile in shared memory. The generic shader reads each column element from a
-// KW-wide gather at offset_delta (input-row) stride — small strided segments
-// that collapse on DRAM-resident signals (ACE-Step Oobleck VAE conv1d); here
-// the reads are contiguous row slabs and the writes stay contiguous along
-// CHW. The host gates this pipeline: 1D only, window fits SMEM_FLOATS, dst
-// addressable without BDA (ggml_vk_im2col_1d_use_tiled; keep the tile
-// constants in sync). Dispatch: x = ceil(OW/TILE_OW), y = ceil(IC/TILE_IC),
-// z = batch.
+// Tiled 1D im2col (KH == OH == 1): stages the contiguous input window for a
+// TILE_OW x TILE_IC tile in shared memory; host-gated by ggml_vk_im2col_1d_use_tiled.
 
 layout (push_constant) uniform parameter
 {

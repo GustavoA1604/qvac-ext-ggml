@@ -7927,9 +7927,8 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
     bool transpose = dst && src->nb[1] == ggml_type_size(to) && ggml_are_same_shape(dst, src);
 
     if (transpose && src->type == to) {
-        // Above the last-level-cache scale, the 64x128 tile's wider contiguous
-        // segments beat the 32x32 tile by an order of magnitude on strided DRAM
-        // reads (measured on Strix Halo: 5 -> ~100 GB/s).
+        // Past the last-level-cache scale, the large tile's wider contiguous
+        // segments beat the 32x32 tile by ~10x on strided reads (Strix Halo).
         const bool large = ggml_nbytes(src) >= 32 * 1024 * 1024 &&
                            ctx->device->pipeline_cpy_transpose_large_32 != nullptr;
         if (ggml_type_size(to) == 4) {
@@ -9981,9 +9980,8 @@ static bool ggml_vk_col2im_1d_use_tiled(const ggml_tensor * dst) {
         CEIL_DIV((int64_t) OC, (int64_t) COL2IM_1D_TILE_OC) > 65535) {
         return false;
     }
-    // The one-thread-per-output pipeline wins while the columns stay
-    // cache-resident; the tiled pipeline wins once they spill to DRAM
-    // (measured on Strix Halo: 4.8-22 GB/s untiled vs 90-146 GB/s tiled).
+    // The untiled pipeline wins while the columns stay cache-resident; the
+    // tiled one wins once they spill to DRAM (measured crossover, Strix Halo).
     return (int64_t) ggml_nbytes(src0) + (int64_t) ggml_nbytes(dst) >= 32 * 1024 * 1024;
 }
 

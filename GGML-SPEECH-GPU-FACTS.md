@@ -53,20 +53,20 @@ verified mechanisms.
   full int8 set (u8/s8 x u8/s8 -> s32/u32, with saturating variants). No bf16
   coopmat. The int8 coopmat hardware capability is currently unused by
   ggml-vulkan shaders.
-- PRE-EXISTING FAILURE on this device: test-backend-ops IM2COL_3D crashes with
-  GGML_ASSERT(ggml-vulkan.cpp:7123) — compute workgroup count exceeds
-  maxComputeWorkGroupCount for large IM2COL_3D cases (the first three small cases
-  pass). ggml-cuda received grid-striding fixes for the analogous overflow
-  (QVAC-23801 im2col/pad); ggml-vulkan's im2col_3d dispatch was not covered.
-  Not part of any AceSTEP graph (VAE is 1D). Full-op sweeps must be run per-op
-  (bin/sweep_ops.sh in the campaign dir) so this crash cannot truncate coverage.
+- FIXED on this branch: test-backend-ops IM2COL_3D used to crash with
+  GGML_ASSERT (compute workgroup count exceeded maxComputeWorkGroupCount[1] =
+  65535 on RADV for large-OW cases) because the elements switch clamped only
+  the z dimension and the shader had no y grid-stride loop. ggml-cuda received
+  grid-striding fixes for the analogous overflow (im2col/pad); ggml-vulkan's
+  im2col_3d dispatch was not covered until now. Was not part of any AceSTEP
+  graph (VAE is 1D).
 - Per-op GPU timing: GGML_VK_PERF_LOGGER=1 (+_CONCURRENT, _FREQUENCY). Memory
   placement audit: GGML_VK_MEMORY_LOGGER=1. Persistent pipeline cache:
   GGML_VK_PIPELINE_CACHE_DIR.
 - SNAKE and COL2IM_1D have implementations on CPU, CUDA (inherited by HIP), Vulkan,
   Metal, OpenCL. No ACE-Step op participates in Vulkan fusion rules.
 
-## Strix Halo memory-access facts (measured, QVAC-24013)
+## Strix Halo memory-access facts (measured on the AceSTEP optimization campaign)
 
 - Linear streaming (big elementwise ADD, 393 MB): ~208 GB/s. Small-segment
   strided access collapses: 128-256 B segments at multi-KiB stride run at

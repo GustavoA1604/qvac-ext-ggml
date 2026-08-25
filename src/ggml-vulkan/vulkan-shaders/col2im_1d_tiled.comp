@@ -2,16 +2,8 @@
 
 #include "types.glsl"
 
-// Tiled col2im_1d: same gather semantics and per-output summation order as
-// col2im_1d.comp, so results are bit-identical to it. Each workgroup stages
-// the input slab for a TILE_T x TILE_OC output tile in shared memory: the
-// contributing rows are contiguous [TILE_OC*K]-float slabs of the column
-// tensor, so global reads and writes both coalesce. The one-thread-per-output
-// shader collapses to sub-10 GB/s once the columns spill past the last-level
-// cache (ACE-Step Oobleck VAE decode); this path stays DRAM-bound instead.
-// Dispatch: x = ceil(T_out/TILE_T), y = ceil(OC/TILE_OC) workgroups. The host
-// gates this pipeline on n_tin*TILE_OC*K <= SMEM_FLOATS (ggml-vulkan.cpp
-// ggml_vk_col2im_1d_use_tiled; keep the tile constants in sync).
+// Tiled col2im_1d: stages the input slab for a TILE_T x TILE_OC output tile in
+// shared memory; same t_in summation order as col2im_1d.comp, so bit-identical.
 
 layout (push_constant) uniform parameter
 {

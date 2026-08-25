@@ -3,13 +3,8 @@
 #include "types.glsl"
 #include "generic_unary_head.glsl"
 
-// Large-tile variant of copy_transpose.comp for DRAM-resident matrices. The
-// 32x32 tile touches 128-byte segments at large strides on both sides, which
-// collapses to a few GB/s once the tensor spills the last-level cache (and a
-// slow enough copy can trip the GPU watchdog). 64x128 tiles read 512-byte and
-// write 256-byte contiguous segments instead. The host selects this pipeline
-// for large tensors on devices with >=512 invocations and enough shared
-// memory; the tile constants are mirrored in ggml-vulkan.cpp.
+// Large-tile variant of copy_transpose.comp: 64x128 tiles read 512-byte and
+// write 256-byte contiguous segments; host-gated by tensor size and device limits.
 
 #define TILE_I00 64
 #define TILE_I01 128
