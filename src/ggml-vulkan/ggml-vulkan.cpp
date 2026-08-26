@@ -731,10 +731,11 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
     // Scalar fp32-arithmetic variant for GGML_PREC_F32, only created when the
-    // default quantized path above multiplies in fp16 (i.e. a coopmat device).
-    // Cooperative matrices are fp16, so the coopmat paths convert F32 activations
-    // to fp16 and clamp anything past 65504; models with activations outside fp16
-    // range (Qwen3-style "massive activations" reach ~1e6) then compute garbage.
+    // default quantized path above multiplies in fp16: a coopmat device, or a
+    // scalar device with fp16 whose shaders stage activations through fp16
+    // shared memory. Both convert F32 activations past 65504 to inf; models
+    // with activations outside fp16 range (Qwen3-style "massive activations"
+    // reach ~1e6) then compute garbage.
     vk_matmul_pipeline pipeline_dequant_mul_mat_mat_fp32[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
@@ -4383,11 +4384,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 
     // Quantized matmul in fp32 arithmetic, selected when the caller asks for
-    // GGML_PREC_F32. Needed only on coopmat devices: cooperative matrices are
-    // fp16, so those paths convert F32 activations to fp16 and saturate values
-    // past 65504, which silently corrupts models whose activations leave fp16
-    // range. Reuses the scalar shaders, so the tile sizes must be scalar too.
-    if (device->coopmat2 || device->coopmat_support) {
+    // GGML_PREC_F32. Needed whenever the default quantized path multiplies in
+    // fp16: cooperative matrices are fp16, and the scalar shaders on an fp16
+    // device stage the F32 activations through fp16 shared memory. Both convert
+    // values past 65504 to inf, which silently corrupts models whose activations
+    // leave fp16 range. Devices without fp16 already build the base pipelines
+    // from the fp32 shader variants, so they need no separate family. Reuses
+    // the scalar shaders, so the tile sizes must be scalar too.
+    if (device->coopmat2 || device->coopmat_support || device->fp16) {
         const uint32_t fp32_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
 
         // Own locals rather than reusing l/m/s_warptile_mmq & friends: those still
