@@ -67,6 +67,19 @@ verified mechanisms.
   GGML_VK_PIPELINE_CACHE_DIR.
 - SNAKE and COL2IM_1D have implementations on CPU, CUDA (inherited by HIP), Vulkan,
   Metal, OpenCL. No ACE-Step op participates in Vulkan fusion rules.
+- Vulkan matmul pipelines come in three device classes: coopmat (fp16 matrix
+  cores), scalar with device fp16 (base shader variants stage tiles through fp16
+  shared memory even for the f32acc pipelines), and scalar without fp16 (base
+  pipelines built from the _fp32 shader variants). GGML_PREC_F32 therefore needs
+  the separate pipeline_dequant_mul_mat_mat_fp32 family on the first TWO classes;
+  gating it on coopmat alone left every non-coopmat fp16 device (e.g. AMD Raphael
+  iGPU on RADV, `fp16: 1 | matrix cores: none`) NaN-ing on quantized MUL_MAT with
+  activations past 65504 (fixed on this branch). test-backend-ops covers this via
+  MUL_MAT b_absmax=1e5 cases; the n=1 cases pass regardless because the mmv path
+  differs.
+- RADV does not expose KHR coopmat on the Raphael iGPU (Mesa 26.0.8): the
+  "RADV gets KHR coopmat unconditionally" fact from Strix Halo (Mesa 25.2.8,
+  RDNA3.5) does not generalize to small RDNA2 iGPUs.
 
 ## Strix Halo memory-access facts (measured on the AceSTEP optimization campaign)
 
