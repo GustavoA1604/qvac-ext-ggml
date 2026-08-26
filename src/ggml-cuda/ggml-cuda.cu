@@ -1616,13 +1616,23 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha = 1.0f;
         const float beta = 0.0f;
 
+        // The handles enable TF32 math by default; an explicit GGML_PREC_F32 request
+        // has to be computed in true f32.
+        const bool disable_tf32 = dst->op_params[0] != GGML_PREC_DEFAULT;
+
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        if (disable_tf32) {
+            CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_DEFAULT_MATH));
+        }
         CUBLAS_CHECK(
             cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
+        if (disable_tf32) {
+            CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(id), CUBLAS_TF32_TENSOR_OP_MATH));
+        }
     }
 
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size);
@@ -2140,6 +2150,13 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);
 
+    // The handles enable TF32 math by default; an explicit GGML_PREC_F32 request on an
+    // f32 matmul has to be computed in true f32.
+    const bool disable_tf32 = src0_type == GGML_TYPE_F32 && dst->op_params[0] != GGML_PREC_DEFAULT;
+    if (disable_tf32) {
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+    }
+
     // broadcast factors
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
@@ -2199,6 +2216,10 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 ne23,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    if (disable_tf32) {
+        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
     }
 
     // Convert output back to F32 if needed
@@ -2428,6 +2449,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
+    }
+
+    if (dst->op_params[0] != GGML_PREC_DEFAULT) {
+        // An explicit GGML_PREC_F32 request requires the activations to survive in f32:
+        // MMQ/MMVQ quantize them to q8_1 whose fp16 block scales/sums overflow past +-65504,
+        // and MMF computes f32 through TF32 MMA. Route to the f32 cuBLAS path instead.
+        use_mul_mat_vec_q = false;
+        use_mul_mat_q     = false;
+        use_mul_mat_f     = use_mul_mat_f && src0->type != GGML_TYPE_F32;
     }
 
     // debug helpers
