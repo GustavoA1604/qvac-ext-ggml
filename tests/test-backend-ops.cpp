@@ -4205,8 +4205,13 @@ struct test_mul_mat_prec_f32 : public test_case {
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided_b ? k + 32 : k, n);
         ggml_set_name(b, "b");
 
-        ggml_tensor * b_in = strided_b ? ggml_view_2d(ctx, b, k, n, b->nb[1], 0) : b;
-        ggml_set_name(b_in, "b_in");
+        // Only name the view separately: naming b_in when it aliases b would rename b
+        // itself and initialize_tensors would no longer recognize it as the activations.
+        ggml_tensor * b_in = b;
+        if (strided_b) {
+            b_in = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+            ggml_set_name(b_in, "b_in");
+        }
 
         ggml_tensor * out = ggml_mul_mat(ctx, a, b_in);
         ggml_mul_mat_set_prec(out, GGML_PREC_F32);
