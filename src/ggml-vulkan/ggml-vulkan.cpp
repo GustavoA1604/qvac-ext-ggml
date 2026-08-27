@@ -15241,6 +15241,8 @@ static ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
         if (ggml_vk_wait_for_fence(ctx) != GGML_STATUS_SUCCESS) {
+            ctx->submit_pending = false;
+            ctx->compute_ctx.reset();
             return ctx->status;
         }
         ctx->submit_pending = false;
@@ -16037,6 +16039,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+
+        if (ctx->status != GGML_STATUS_SUCCESS) {
+            ctx->compute_ctx.reset();
+            return ctx->status;
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
