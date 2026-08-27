@@ -2072,9 +2072,6 @@ struct ggml_backend_vk_context {
 
     vk_device device;
     ggml_status status = GGML_STATUS_SUCCESS;
-    int64_t test_device_lost_after_graph = 0;
-    int64_t graph_count = 0;
-    bool test_device_lost_pending = false;
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -2289,12 +2286,6 @@ static ggml_status ggml_vk_set_error(ggml_backend_vk_context * ctx, vk::Result r
     return ctx->status;
 }
 
-static bool ggml_vk_inject_device_lost(ggml_backend_vk_context * ctx) {
-    const bool inject = ctx->test_device_lost_pending;
-    ctx->test_device_lost_pending = false;
-    return inject;
-}
-
 // Wait for ctx->fence to be signaled.
 static ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
@@ -2328,9 +2319,6 @@ static ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
-    if (ggml_vk_inject_device_lost(ctx)) {
-        return ggml_vk_set_error(ctx, vk::Result::eErrorDeviceLost, "injected fence synchronization");
-    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -6638,11 +6626,6 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
-
-    const char * test_device_lost = getenv("GGML_VK_TEST_DEVICE_LOST_AFTER_GRAPH");
-    if (test_device_lost != nullptr) {
-        ctx->test_device_lost_after_graph = std::atoll(test_device_lost);
-    }
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
@@ -15734,10 +15717,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (ctx->status != GGML_STATUS_SUCCESS) {
         return ctx->status;
     }
-    ctx->graph_count++;
-    ctx->test_device_lost_pending =
-        ctx->test_device_lost_after_graph > 0 &&
-        ctx->graph_count == ctx->test_device_lost_after_graph;
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
