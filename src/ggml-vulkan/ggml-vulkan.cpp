@@ -2304,10 +2304,7 @@ static ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         if (result != vk::Result::eSuccess) {
             return ggml_vk_set_error(ctx, result, "waitForFences(almost_ready_fence)");
         }
-        result = ctx->device->device.resetFences({ ctx->almost_ready_fence });
-        if (result != vk::Result::eSuccess) {
-            return ggml_vk_set_error(ctx, result, "resetFences(almost_ready_fence)");
-        }
+        ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
     }
 
@@ -2330,10 +2327,7 @@ static ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
             YIELD();
         }
     }
-    result = ctx->device->device.resetFences({ ctx->fence });
-    if (result != vk::Result::eSuccess) {
-        return ggml_vk_set_error(ctx, result, "resetFences");
-    }
+    ctx->device->device.resetFences({ ctx->fence });
     if (ggml_vk_inject_device_lost(ctx)) {
         return ggml_vk_set_error(ctx, vk::Result::eErrorDeviceLost, "injected fence synchronization");
     }
