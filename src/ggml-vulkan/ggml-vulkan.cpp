@@ -281,7 +281,7 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -2071,6 +2071,10 @@ struct ggml_backend_vk_context {
     std::string name;
 
     vk_device device;
+    ggml_status status = GGML_STATUS_SUCCESS;
+    int64_t test_device_lost_after_graph = 0;
+    int64_t graph_count = 0;
+    bool test_device_lost_pending = false;
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -2276,13 +2280,34 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
+static ggml_status ggml_vk_set_error(ggml_backend_vk_context * ctx, vk::Result result, const char * operation) {
+    if (ctx->status == GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ggml_vulkan: %s failed with %s; backend context is no longer usable\n",
+                operation, to_string(result).c_str());
+    }
+    ctx->status = GGML_STATUS_FAILED;
+    return ctx->status;
+}
+
+static bool ggml_vk_inject_device_lost(ggml_backend_vk_context * ctx) {
+    const bool inject = ctx->test_device_lost_pending;
+    ctx->test_device_lost_pending = false;
+    return inject;
+}
+
 // Wait for ctx->fence to be signaled.
-static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+static ggml_status ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
-        ctx->device->device.resetFences({ ctx->almost_ready_fence });
+        vk::Result result = ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX);
+        if (result != vk::Result::eSuccess) {
+            return ggml_vk_set_error(ctx, result, "waitForFences(almost_ready_fence)");
+        }
+        result = ctx->device->device.resetFences({ ctx->almost_ready_fence });
+        if (result != vk::Result::eSuccess) {
+            return ggml_vk_set_error(ctx, result, "resetFences(almost_ready_fence)");
+        }
         ctx->almost_ready_fence_pending = false;
     }
 
@@ -2290,8 +2315,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     vk::Result result;
     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
-            exit(1);
+            return ggml_vk_set_error(ctx, result, "getFenceStatus");
         }
         for (uint32_t i = 0; i < 100; ++i) {
             YIELD();
@@ -2306,7 +2330,14 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
             YIELD();
         }
     }
-    ctx->device->device.resetFences({ ctx->fence });
+    result = ctx->device->device.resetFences({ ctx->fence });
+    if (result != vk::Result::eSuccess) {
+        return ggml_vk_set_error(ctx, result, "resetFences");
+    }
+    if (ggml_vk_inject_device_lost(ctx)) {
+        return ggml_vk_set_error(ctx, vk::Result::eErrorDeviceLost, "injected fence synchronization");
+    }
+    return GGML_STATUS_SUCCESS;
 }
 
 // variables to track number of compiles in progress
@@ -6613,6 +6644,11 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
+
+    const char * test_device_lost = getenv("GGML_VK_TEST_DEVICE_LOST_AFTER_GRAPH");
+    if (test_device_lost != nullptr) {
+        ctx->test_device_lost_after_graph = std::atoll(test_device_lost);
+    }
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
@@ -15159,8 +15195,12 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+static ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+
+    if (ctx->status != GGML_STATUS_SUCCESS) {
+        return ctx->status;
+    }
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
@@ -15206,7 +15246,9 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             std::lock_guard<std::mutex> guard(queue_mutex);
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
-        ggml_vk_wait_for_fence(ctx);
+        if (ggml_vk_wait_for_fence(ctx) != GGML_STATUS_SUCCESS) {
+            return ctx->status;
+        }
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
@@ -15220,13 +15262,14 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+    return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    ggml_vk_synchronize(ctx);
+    (void) ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
 }
@@ -15692,6 +15735,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    if (ctx->status != GGML_STATUS_SUCCESS) {
+        return ctx->status;
+    }
+    ctx->graph_count++;
+    ctx->test_device_lost_pending =
+        ctx->test_device_lost_after_graph > 0 &&
+        ctx->graph_count == ctx->test_device_lost_after_graph;
+
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
         dul.pLabelName = "ggml_backend_vk_graph_compute";
@@ -16078,7 +16129,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (!ctx->device->support_async) {
-        ggml_vk_synchronize(ctx);
+        return ggml_vk_synchronize(ctx);
     }
 
     return GGML_STATUS_SUCCESS;
