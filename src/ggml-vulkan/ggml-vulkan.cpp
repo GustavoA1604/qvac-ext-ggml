@@ -13951,7 +13951,8 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, {});
         ctx->submit_pending = true;
-        ggml_vk_synchronize(ctx);
+        // Failure remains sticky and is returned by the enclosing graph computation.
+        (void) ggml_vk_synchronize(ctx);
         GGML_ASSERT(ctx->compute_ctx.expired());
         ggml_vk_ctx_begin(ctx->device, subctx);
         ctx->compute_ctx = subctx;
@@ -14563,7 +14564,8 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         ctx->submit_pending = true;
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
-        ggml_vk_synchronize(ctx);
+        // Failure remains sticky and is returned by the enclosing graph computation.
+        (void) ggml_vk_synchronize(ctx);
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
 #endif
     }
@@ -14629,7 +14631,8 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
     // wait for any pending command buffers to finish
-    ggml_vk_synchronize(ctx);
+    // Cleanup cannot report synchronization failures; the context keeps the sticky status.
+    (void) ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
 
@@ -15045,7 +15048,8 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
                 deferred_memcpy((uint8_t *)ctx->sync_staging->ptr + i * size, (const uint8_t *)data + i * stride_data, size, &cpy_ctx->in_memcpys);
             }
         }
-        ggml_vk_synchronize(ctx);
+        // The void tensor API defers a sticky failure to the next graph computation.
+        (void) ggml_vk_synchronize(ctx);
     }
 }
 
@@ -15101,7 +15105,8 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                 deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)ctx->sync_staging->ptr + i * size, size, &compute_ctx->out_memcpys);
             }
         }
-        ggml_vk_synchronize(ctx);
+        // The void tensor API defers a sticky failure; read data is invalid on failure.
+        (void) ggml_vk_synchronize(ctx);
     }
 }
 
@@ -15248,6 +15253,7 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
+    // The backend API is void; a sticky failure is returned by the next graph computation.
     (void) ggml_vk_synchronize(ctx);
 
     ggml_vk_graph_cleanup(ctx);
@@ -16116,6 +16122,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     UNUSED(backend);
 }
+
+#ifdef GGML_VULKAN_TESTING
+extern "C" GGML_BACKEND_API bool ggml_backend_vk_test_sticky_status(void) {
+    ggml_backend_vk_context ctx = {};
+    ctx.status = GGML_STATUS_FAILED;
+
+    ggml_backend backend = {};
+    backend.context = &ctx;
+    ggml_cgraph graph = {};
+
+    return ggml_vk_synchronize(&ctx) == GGML_STATUS_FAILED &&
+           ggml_backend_vk_graph_compute(&backend, &graph) == GGML_STATUS_FAILED;
+}
+#endif
 
 // Sort the graph for improved parallelism.
 static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph)
