@@ -186,6 +186,13 @@ if (GGML_OPENCL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 
+if (GGML_VULKAN)
+    set(TEST_TARGET test-vulkan-status)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vulkan)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
 if (NOT GGML_BACKEND_DL)
     #
     # test-opt
